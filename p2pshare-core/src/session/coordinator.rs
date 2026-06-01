@@ -247,8 +247,14 @@ pub async fn lookup_and_connect(
 
     eprintln!("[connect] hole punching...");
     hole_punch(socket.clone(), sender_addr).await?;
-    // Give the sender time to finish its hole punch and start the QUIC server.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Our hole_punch completed (we got a punch from sender), but sender still needs
+    // to receive a punch from us to finish its own hole_punch and start the QUIC server.
+    // Keep punching until we hand the socket to QUIC (~600ms).
+    for _ in 0..10 {
+        let _ = socket.send_to(b"p2pshare-punch", sender_addr).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
 
     eprintln!("[connect] QUIC client connecting...");
 

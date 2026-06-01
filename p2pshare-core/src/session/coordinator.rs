@@ -16,7 +16,7 @@ use crate::{
     identity::{fingerprint::to_fingerprint, storage::UserIdentity},
     nat::{
         hole_punch::hole_punch,
-        quic::{make_client_endpoint, make_server_endpoint, skip_verify_client_config},
+        quic::{make_client_endpoint, make_server_endpoint_with_config, prebuilt_server_config, skip_verify_client_config},
         stun::external_addr,
     },
     transfer::manifest::ControlMessage,
@@ -129,6 +129,9 @@ pub async fn announce_and_connect(
     identity: &UserIdentity,
     dht: &DhtLayer,
 ) -> Result<(String, PeerSession)> {
+    // Generate TLS cert before any network work so it's ready the moment hole punch completes.
+    let server_cfg = prebuilt_server_config()?;
+
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let local_port = socket.local_addr()?.port();
     let socket = Arc::new(socket);
@@ -169,7 +172,7 @@ pub async fn announce_and_connect(
     let std_socket = Arc::try_unwrap(socket)
         .map_err(|_| Error::ConnectionFailed("socket still borrowed".to_string()))?
         .into_std()?;
-    let endpoint = make_server_endpoint(std_socket)?;
+    let endpoint = make_server_endpoint_with_config(std_socket, server_cfg)?;
 
     let incoming = timeout(Duration::from_secs(15), endpoint.accept())
         .await

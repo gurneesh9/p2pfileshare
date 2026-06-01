@@ -12,10 +12,9 @@ use crate::{Error, Result};
 
 // ── Server endpoint ────────────────────────────────────────────────────────────
 
-/// Build a QUIC server endpoint from a (punched) UDP socket.
-///
-/// Generates a throwaway self-signed TLS cert; Noise XX is the real auth layer.
-pub fn make_server_endpoint(socket: UdpSocket) -> Result<Endpoint> {
+/// Pre-build a QUIC ServerConfig (including TLS cert generation) so it's ready
+/// the moment hole punch completes, with no blocking work on the critical path.
+pub fn prebuilt_server_config() -> Result<ServerConfig> {
     let CertifiedKey { cert, key_pair } =
         generate_simple_self_signed(vec!["p2pshare".to_string()])
             .map_err(|e| Error::Quic(e.to_string()))?;
@@ -24,7 +23,6 @@ pub fn make_server_endpoint(socket: UdpSocket) -> Result<Endpoint> {
     let key_der: PrivateKeyDer<'static> =
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
 
-    // Explicit ring provider — avoids global provider auto-detection
     let ring = Arc::new(rustls::crypto::ring::default_provider());
     let rustls_srv = rustls::ServerConfig::builder_with_provider(ring)
         .with_protocol_versions(&[&TLS13])
@@ -36,11 +34,14 @@ pub fn make_server_endpoint(socket: UdpSocket) -> Result<Endpoint> {
     let quic_srv = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_srv)
         .map_err(|e| Error::Quic(e.to_string()))?;
 
-    let server_cfg = ServerConfig::with_crypto(Arc::new(quic_srv));
+    Ok(ServerConfig::with_crypto(Arc::new(quic_srv)))
+}
 
+/// Build a QUIC server endpoint from a pre-built ServerConfig and a punched socket.
+pub fn make_server_endpoint_with_config(socket: UdpSocket, cfg: ServerConfig) -> Result<Endpoint> {
     Endpoint::new(
         EndpointConfig::default(),
-        Some(server_cfg),
+        Some(cfg),
         socket,
         Arc::new(TokioRuntime),
     )

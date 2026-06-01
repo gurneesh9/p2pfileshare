@@ -40,7 +40,7 @@ pub async fn hole_punch(socket: Arc<UdpSocket>, peer_addr: SocketAddr) -> Result
                 Ok((len, addr)) if addr == peer_addr && &buf[..len] == PUNCH_MAGIC => {
                     return Ok::<(), Error>(());
                 }
-                Ok(_) => continue, // ignore unrelated packets
+                Ok(_) => continue,
                 Err(e) => return Err(Error::Io(e)),
             }
         }
@@ -49,7 +49,7 @@ pub async fn hole_punch(socket: Arc<UdpSocket>, peer_addr: SocketAddr) -> Result
 
     stop.store(true, Ordering::Relaxed);
     punch_task.abort();
-    let _ = punch_task.await; // ensure send_socket Arc clone is dropped
+    let _ = punch_task.await;
 
     match result {
         Ok(Ok(())) => Ok(()),

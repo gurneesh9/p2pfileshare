@@ -42,6 +42,12 @@ enum Command {
         output: PathBuf,
     },
 
+    /// Look up a share code on the DHT and print the resolved peer address (no connection)
+    Lookup {
+        /// Share code to look up (e.g. MANGO-4471)
+        code: String,
+    },
+
     /// Phase-2 test: announce a code, complete handshake, print remote fingerprint
     Announce,
 
@@ -101,6 +107,35 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
             println!("Fingerprint: {}", identity.fingerprint);
             println!("Public key:  {}", identity.public_key);
             println!("Created:     {}", fmt_age(identity.created_at));
+        }
+
+        // ── Lookup (DHT only, no connection) ─────────────────────────────────
+        Command::Lookup { code } => {
+            use p2pshare_core::discovery::share_code::to_infohash;
+            use std::time::Duration;
+
+            let code = code.to_uppercase();
+            let infohash = to_infohash(&code);
+            let dht = DhtLayer::new()?;
+
+            println!("Looking up {} on DHT...", code);
+            println!("Infohash: {}", hex::encode(infohash));
+            println!("(retrying for up to 30s — DHT may need time to propagate)");
+
+            let peers = dht
+                .lookup_with_retry(infohash, Duration::from_secs(30), Duration::from_secs(3))
+                .await;
+
+            if peers.is_empty() {
+                println!("No peers found after 30s.");
+                println!("Check that the sender's `announce` is still running and that");
+                println!("UDP traffic is not blocked by a firewall.");
+            } else {
+                println!("Found {} peer(s):", peers.len());
+                for addr in &peers {
+                    println!("  {addr}");
+                }
+            }
         }
 
         // ── Send ──────────────────────────────────────────────────────────────

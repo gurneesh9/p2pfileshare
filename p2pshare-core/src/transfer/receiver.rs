@@ -1,0 +1,237 @@
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+use crate::{session::coordinator::PeerSession, Error, Result};
+
+use super::manifest::{ControlMessage, TransferMode};
+use super::resume::{TransferState, find_resumable};
+
+/// Accept manifest, negotiate resume, receive all chunks, verify, write to `output_dir`.
+/// Returns the path of the completed file.
+pub async fn receive_file(session: &PeerSession, output_dir: &Path) -> Result<PathBuf> {
+    // ── Accept control stream ──────────────────────────────────────────────────
+    let (mut ctrl_send, mut ctrl_recv) = session
+        .connection
+        .accept_bi()
+        .await
+        .map_err(|e| Error::Quic(e.to_string()))?;
+
+    // ── Receive manifest ───────────────────────────────────────────────────────
+    let manifest = match session.recv_ctrl(&mut ctrl_recv).await? {
+        ControlMessage::Manifest(m) => m,
+        other => {
+            return Err(Error::ConnectionFailed(format!(
+                "expected Manifest, got {:?}",
+                other
+            )))
+        }
+    };
+
+    if matches!(manifest.transfer_mode, TransferMode::Streaming(_)) {
+        session
+            .send_ctrl(
+                &mut ctrl_send,
+                &ControlMessage::Error {
+                    code: 1,
+                    message: "Streaming mode not implemented".to_string(),
+                },
+            )
+            .await?;
+        return Err(Error::ConnectionFailed(
+            "streaming mode not supported".to_string(),
+        ));
+    }
+
+    eprintln!(
+        "[recv] '{}' — {} bytes, {} chunks",
+        manifest.filename, manifest.total_size, manifest.chunk_count
+    );
+
+    let output_path = output_dir.join(&manifest.filename);
+
+    // ── Resume or fresh start ──────────────────────────────────────────────────
+    let mut state = match find_resumable(&manifest, output_dir) {
+        Some(existing) => {
+            eprintln!(
+                "[recv] resuming: already have {}/{} chunks",
+                existing.chunks_done.len(),
+                manifest.chunk_count
+            );
+            session
+                .send_ctrl(
+                    &mut ctrl_send,
+                    &ControlMessage::ResumeRequest {
+                        have_chunks: existing.chunks_done.iter().copied().collect(),
+                    },
+                )
+                .await?;
+            existing
+        }
+        None => {
+            tokio::fs::create_dir_all(output_dir).await?;
+            // Pre-allocate so we can seek and write chunks in any order
+            {
+                let f = tokio::fs::File::create(&output_path).await?;
+                f.set_len(manifest.total_size).await?;
+            }
+            session
+                .send_ctrl(&mut ctrl_send, &ControlMessage::ManifestAck)
+                .await?;
+            TransferState::new(manifest.clone(), output_path.clone())
+        }
+    };
+
+    // ── Receive chunks ─────────────────────────────────────────────────────────
+    let mut pending: HashSet<u32> = state.missing_chunks().into_iter().collect();
+
+    while !pending.is_empty() {
+        // Accept the next incoming unidirectional stream
+        let mut recv_stream = session
+            .connection
+            .accept_uni()
+            .await
+            .map_err(|e| Error::Quic(e.to_string()))?;
+
+        // Read header: [4-byte BE chunk_index]
+        let mut idx_buf = [0u8; 4];
+        recv_stream.read_exact(&mut idx_buf).await?;
+        let chunk_index = u32::from_be_bytes(idx_buf);
+
+        // Read encrypted payload (2MB cap — 1MB chunk + 16 bytes + headroom)
+        let ciphertext = recv_stream
+            .read_to_end(2 * 1024 * 1024)
+            .await
+            .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
+
+        // Decrypt using PeerSession helper (nonce = CHUNK_NONCE_BASE + chunk_index)
+        let plaintext = session.decrypt_chunk(chunk_index, &ciphertext)?;
+
+        // Verify SHA-256 against manifest
+        let actual: [u8; 32] = Sha256::digest(&plaintext).into();
+        let expected = manifest.chunks[chunk_index as usize].hash;
+
+        if actual != expected {
+            eprintln!("[recv] chunk {} hash mismatch — NACKing", chunk_index);
+            session
+                .send_ctrl(&mut ctrl_send, &ControlMessage::ChunkNack { index: chunk_index })
+                .await?;
+            continue;
+        }
+
+        // Write at the correct offset
+        let offset = chunk_index as u64 * manifest.chunk_size as u64;
+        write_at(&output_path, offset, &plaintext).await?;
+
+        pending.remove(&chunk_index);
+        state.chunks_done.insert(chunk_index);
+        state.save()?;
+
+        let done = manifest.chunk_count as usize - pending.len();
+        eprintln!("[recv] chunk {} ✓  ({}/{})", chunk_index, done, manifest.chunk_count);
+    }
+
+    // ── Signal complete ────────────────────────────────────────────────────────
+    session
+        .send_ctrl(&mut ctrl_send, &ControlMessage::Complete)
+        .await?;
+
+    eprintln!("[recv] complete ✓ → {}", output_path.display());
+
+    state.delete()?;
+    Ok(output_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        identity::keypair::Keypair,
+        nat::quic::{make_client_endpoint, make_server_endpoint, skip_verify_client_config},
+        session::coordinator::PeerSession,
+        crypto::handshake::{perform_handshake, HandshakeRole},
+        transfer::sender::send_file,
+    };
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        sync::{Arc, Mutex, atomic::AtomicU64},
+    };
+    use tokio::net::UdpSocket;
+
+    fn make_session(conn: quinn::Connection, transport: snow::StatelessTransportState, pubkey: [u8; 32]) -> PeerSession {
+        use crate::identity::fingerprint::to_fingerprint;
+        PeerSession {
+            connection: conn,
+            remote_fingerprint: to_fingerprint(&pubkey),
+            remote_pubkey: pubkey,
+            noise: Arc::new(Mutex::new(transport)),
+            send_nonce: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_file_transfer() {
+        // Create a temp file to send
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("hello.txt");
+        let content = b"Hello, P2PShare! This is a test file for loopback transfer.";
+        tokio::fs::write(&src, content).await.unwrap();
+
+        let out_dir = tmp.path().join("recv");
+        tokio::fs::create_dir_all(&out_dir).await.unwrap();
+
+        // Keypairs
+        let kp_sender = Keypair::generate();
+        let kp_receiver = Keypair::generate();
+
+        // QUIC endpoints
+        let srv_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16)).await.unwrap();
+        let srv_addr: SocketAddr = (Ipv4Addr::LOCALHOST, srv_sock.local_addr().unwrap().port()).into();
+        let srv_ep = make_server_endpoint(srv_sock.into_std().unwrap()).unwrap();
+
+        let cli_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16)).await.unwrap();
+        let cli_ep = make_client_endpoint(cli_sock.into_std().unwrap()).unwrap();
+        let cli_cfg = skip_verify_client_config().unwrap();
+
+        let sender_privkey = kp_sender.secret;
+        let receiver_privkey = kp_receiver.secret;
+        let _sender_pubkey = kp_sender.public;
+        let receiver_pubkey = kp_receiver.public;
+
+        let src_clone = src.clone();
+
+        // Sender (server role for QUIC + Noise responder)
+        let send_handle = tokio::spawn(async move {
+            let incoming = srv_ep.accept().await.unwrap();
+            let conn = incoming.accept().unwrap().await.unwrap();
+            let (mut s, mut r) = conn.accept_bi().await.unwrap();
+            let hs = perform_handshake(&mut s, &mut r, &sender_privkey, HandshakeRole::Responder).await.unwrap();
+            let session = make_session(conn, hs.transport, hs.remote_pubkey);
+            send_file(&session, &src_clone).await.unwrap();
+            hs.remote_pubkey  // return receiver's pubkey to verify
+        });
+
+        // Receiver (client role for QUIC + Noise initiator)
+        let conn = cli_ep.connect_with(cli_cfg, srv_addr, "p2pshare").unwrap().await.unwrap();
+        let (mut s, mut r) = conn.open_bi().await.unwrap();
+        let hs = perform_handshake(&mut s, &mut r, &receiver_privkey, HandshakeRole::Initiator).await.unwrap();
+        let session = make_session(conn, hs.transport, hs.remote_pubkey);
+        let out_path = receive_file(&session, &out_dir).await.unwrap();
+
+        // Verify the sender task completed
+        let remote = send_handle.await.unwrap();
+        assert_eq!(remote, receiver_pubkey, "sender sees receiver's pubkey");
+
+        // Verify file contents match
+        let received = tokio::fs::read(&out_path).await.unwrap();
+        assert_eq!(received, content);
+    }
+}
+
+async fn write_at(path: &Path, offset: u64, data: &[u8]) -> Result<()> {
+    let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    file.write_all(data).await?;
+    Ok(())
+}

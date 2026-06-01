@@ -1,0 +1,15 @@
+# Rust build output
+/target/
+Cargo.lock
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Dev identity and local data (never commit private keys)
+~/.config/p2pshare/

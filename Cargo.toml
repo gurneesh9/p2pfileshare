@@ -1,0 +1,3 @@
+[workspace]
+members = ["p2pshare-core", "p2pshare-cli"]
+resolver = "2"

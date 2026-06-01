@@ -1,0 +1,15 @@
+[package]
+name = "p2pshare-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "p2pshare"
+path = "src/main.rs"
+
+[dependencies]
+p2pshare-core = { path = "../p2pshare-core" }
+tokio         = { version = "1", features = ["full"] }
+clap          = { version = "4", features = ["derive"] }
+hex           = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

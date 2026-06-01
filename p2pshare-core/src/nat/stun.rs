@@ -1,0 +1,97 @@
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::time::Duration;
+use tokio::net::UdpSocket;
+
+const MAGIC_COOKIE: u32 = 0x2112A442;
+const STUN_SERVERS: &[&str] = &[
+    "stun.l.google.com:19302",
+    "stun1.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+];
+
+/// Send a STUN Binding Request on `socket` and return the external SocketAddr.
+///
+/// The socket must already be bound. We try each STUN server in order and
+/// return the first successful mapping.
+pub async fn external_addr(socket: &UdpSocket) -> Option<SocketAddr> {
+    for server in STUN_SERVERS {
+        if let Ok(addrs) = tokio::net::lookup_host(server).await {
+            for server_addr in addrs {
+                if let Ok(addr) = query_stun(socket, server_addr).await {
+                    return Some(addr);
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn query_stun(socket: &UdpSocket, server: SocketAddr) -> std::io::Result<SocketAddr> {
+    // Build Binding Request
+    let txn_id: [u8; 12] = rand::random();
+    let mut req = [0u8; 20];
+    req[0..2].copy_from_slice(&0x0001u16.to_be_bytes()); // Binding Request
+    req[2..4].copy_from_slice(&0x0000u16.to_be_bytes()); // length = 0
+    req[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+    req[8..20].copy_from_slice(&txn_id);
+
+    socket.send_to(&req, server).await?;
+
+    let mut buf = [0u8; 512];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "STUN timeout"))??;
+
+    parse_response(&buf[..len], &txn_id)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad STUN response"))
+}
+
+fn parse_response(buf: &[u8], txn_id: &[u8; 12]) -> Option<SocketAddr> {
+    if buf.len() < 20 {
+        return None;
+    }
+    // Must be Binding Success Response (0x0101)
+    if u16::from_be_bytes([buf[0], buf[1]]) != 0x0101 {
+        return None;
+    }
+    // Transaction ID must match
+    if &buf[8..20] != txn_id {
+        return None;
+    }
+
+    let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let attrs = buf.get(20..20 + msg_len)?;
+
+    let mut i = 0;
+    while i + 4 <= attrs.len() {
+        let attr_type = u16::from_be_bytes([attrs[i], attrs[i + 1]]);
+        let attr_len = u16::from_be_bytes([attrs[i + 2], attrs[i + 3]]) as usize;
+        let val = attrs.get(i + 4..i + 4 + attr_len)?;
+
+        match attr_type {
+            // XOR-MAPPED-ADDRESS (preferred)
+            0x0020 => {
+                if val.len() >= 8 && val[1] == 0x01 {
+                    let port = u16::from_be_bytes([val[2], val[3]]) ^ 0x2112;
+                    let ip_raw = u32::from_be_bytes([val[4], val[5], val[6], val[7]])
+                        ^ MAGIC_COOKIE;
+                    let ip = Ipv4Addr::from(ip_raw);
+                    return Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+                }
+            }
+            // MAPPED-ADDRESS (fallback)
+            0x0001 => {
+                if val.len() >= 8 && val[1] == 0x01 {
+                    let port = u16::from_be_bytes([val[2], val[3]]);
+                    let ip = Ipv4Addr::new(val[4], val[5], val[6], val[7]);
+                    return Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+                }
+            }
+            _ => {}
+        }
+
+        // attributes are 4-byte aligned
+        i += 4 + ((attr_len + 3) & !3);
+    }
+    None
+}

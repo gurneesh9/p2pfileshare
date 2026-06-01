@@ -17,6 +17,7 @@ use crate::{
     nat::{
         hole_punch::hole_punch,
         quic::{make_client_endpoint, make_server_endpoint, skip_verify_client_config},
+        stun::external_addr,
     },
     transfer::manifest::ControlMessage,
     Error, Result,
@@ -143,9 +144,19 @@ pub async fn announce_and_connect(
         expires_in / 60,
         expires_in % 60
     );
-    eprintln!("[announce] announcing on DHT, local port {}", local_port);
+    let announce_port = match external_addr(&socket).await {
+        Some(ext) => {
+            eprintln!("[announce] STUN: external address is {}", ext);
+            ext.port()
+        }
+        None => {
+            eprintln!("[announce] STUN failed, falling back to local port {}", local_port);
+            local_port
+        }
+    };
 
-    dht.announce(infohash_send, local_port).await;
+    eprintln!("[announce] announcing on DHT, port {}", announce_port);
+    dht.announce(infohash_send, announce_port).await;
 
     eprintln!("[announce] waiting for receiver...");
     let receiver_addr = poll_for_receiver(dht, infohash_recv, 60).await?;
@@ -217,8 +228,19 @@ pub async fn lookup_and_connect(
     let local_port = socket.local_addr()?.port();
     let socket = Arc::new(socket);
 
-    eprintln!("[connect] back-announcing on DHT, port {}...", local_port);
-    dht.announce(infohash_recv, local_port).await;
+    let announce_port = match external_addr(&socket).await {
+        Some(ext) => {
+            eprintln!("[connect] STUN: external address is {}", ext);
+            ext.port()
+        }
+        None => {
+            eprintln!("[connect] STUN failed, falling back to local port {}", local_port);
+            local_port
+        }
+    };
+
+    eprintln!("[connect] back-announcing on DHT, port {}...", announce_port);
+    dht.announce(infohash_recv, announce_port).await;
 
     eprintln!("[connect] hole punching...");
     hole_punch(socket.clone(), sender_addr).await?;

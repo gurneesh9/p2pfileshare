@@ -49,6 +49,7 @@ pub async fn hole_punch(socket: Arc<UdpSocket>, peer_addr: SocketAddr) -> Result
 
     stop.store(true, Ordering::Relaxed);
     punch_task.abort();
+    let _ = punch_task.await; // ensure send_socket Arc clone is dropped
 
     match result {
         Ok(Ok(())) => Ok(()),

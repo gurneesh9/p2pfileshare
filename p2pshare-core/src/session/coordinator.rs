@@ -92,32 +92,57 @@ impl PeerSession {
             .map_err(|e| Error::MsgPack(e.to_string()))
     }
 
-    /// Encrypt one chunk with `nonce = CHUNK_NONCE_BASE + chunk_index`.
+    /// Encrypt one chunk, splitting into Noise sub-messages if needed.
+    ///
+    /// Noise's AEAD limit is 65535 bytes per message (65519 plaintext + 16 tag).
+    /// We use a fixed sub-message size and encode the count as a 2-byte prefix so
+    /// the receiver knows how many sub-messages to read.
     pub fn encrypt_chunk(&self, chunk_index: u32, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = CHUNK_NONCE_BASE + chunk_index as u64;
-        let mut ciphertext = vec![0u8; plaintext.len() + 16];
-        let len = self
-            .noise
-            .lock()
-            .unwrap()
-            .write_message(nonce, plaintext, &mut ciphertext)
-            .map_err(|e| Error::Noise(e.to_string()))?;
-        ciphertext.truncate(len);
-        Ok(ciphertext)
+        const MAX_PLAIN: usize = 65519;
+        let mut out = Vec::with_capacity(plaintext.len() + 32);
+        let sub_count = plaintext.chunks(MAX_PLAIN).count() as u16;
+        out.extend_from_slice(&sub_count.to_be_bytes());
+        let noise = self.noise.lock().unwrap();
+        for (i, sub) in plaintext.chunks(MAX_PLAIN).enumerate() {
+            let nonce = CHUNK_NONCE_BASE + chunk_index as u64 * 256 + i as u64;
+            let mut buf = vec![0u8; sub.len() + 16];
+            let len = noise
+                .write_message(nonce, sub, &mut buf)
+                .map_err(|e| Error::Noise(e.to_string()))?;
+            out.extend_from_slice(&(len as u32).to_be_bytes());
+            out.extend_from_slice(&buf[..len]);
+        }
+        Ok(out)
     }
 
-    /// Decrypt one chunk.
+    /// Decrypt one chunk, reassembling from Noise sub-messages.
     pub fn decrypt_chunk(&self, chunk_index: u32, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = CHUNK_NONCE_BASE + chunk_index as u64;
-        let mut plaintext = vec![0u8; ciphertext.len()];
-        let len = self
-            .noise
-            .lock()
-            .unwrap()
-            .read_message(nonce, ciphertext, &mut plaintext)
-            .map_err(|e| Error::Noise(e.to_string()))?;
-        plaintext.truncate(len);
-        Ok(plaintext)
+        const MAX_PLAIN: usize = 65519;
+        if ciphertext.len() < 2 {
+            return Err(Error::Noise("chunk too short".into()));
+        }
+        let sub_count = u16::from_be_bytes([ciphertext[0], ciphertext[1]]) as usize;
+        let mut pos = 2;
+        let mut out = Vec::new();
+        let noise = self.noise.lock().unwrap();
+        for i in 0..sub_count {
+            if pos + 4 > ciphertext.len() {
+                return Err(Error::Noise("truncated sub-message length".into()));
+            }
+            let sub_len = u32::from_be_bytes(ciphertext[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + sub_len > ciphertext.len() {
+                return Err(Error::Noise("truncated sub-message body".into()));
+            }
+            let nonce = CHUNK_NONCE_BASE + chunk_index as u64 * 256 + i as u64;
+            let mut buf = vec![0u8; MAX_PLAIN];
+            let len = noise
+                .read_message(nonce, &ciphertext[pos..pos + sub_len], &mut buf)
+                .map_err(|e| Error::Noise(e.to_string()))?;
+            out.extend_from_slice(&buf[..len]);
+            pos += sub_len;
+        }
+        Ok(out)
     }
 }
 

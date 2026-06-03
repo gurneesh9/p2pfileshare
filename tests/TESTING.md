@@ -248,6 +248,181 @@ Each `send` generates a new share code and connection.
 
 ---
 
+## Phase 4 — Relay (Symmetric NAT Fallback)
+
+The relay at `34.68.99.198:443` is a dumb TCP pipe — it forwards encrypted bytes
+between two peers without being able to read anything. Hole punching is still
+attempted first; the relay is only used when hole punching times out.
+
+### 4.1 Verify the relay server is up
+
+```bash
+# Should connect and then hang (relay is waiting for a second client)
+# Ctrl-C after 2 seconds — no error means the server accepted the connection
+nc -zv 34.68.99.198 443
+# Expected: Connection to 34.68.99.198 port 443 [tcp] succeeded!
+```
+
+Or with curl:
+```bash
+curl --connect-timeout 5 -v telnet://34.68.99.198:443 2>&1 | head -5
+# Expected: "Connected to 34.68.99.198"
+```
+
+### 4.2 Force a relay connection (loopback test)
+
+Because hole punching almost always succeeds on loopback, you need to temporarily
+make hole punching fail to exercise the relay path. The cleanest way is to use a
+loopback address that causes the punch to time out, or to use the network diagnostic
+below.
+
+**Method: drop punch packets with a firewall rule (macOS)**
+
+In a third terminal, block outbound UDP on the loopback port the sender is using:
+
+> This is only needed to simulate symmetric NAT in a controlled environment.
+> Skip to 4.3 if you have two machines on different NAT types.
+
+```bash
+# Terminal A — note the local port that appears in the STUN output, e.g. 51234
+p2pshare send /tmp/test.txt
+# [announce] STUN: external address is X.X.X.X:51234   ← note this port
+```
+
+```bash
+# Terminal C — block UDP so hole punch times out
+sudo pfctl -e
+echo "block drop quick proto udp from any port 51234" | sudo pfctl -f -
+```
+
+Terminal B then connects normally:
+```bash
+p2pshare receive WORD-NNNN
+```
+
+With UDP blocked the punch will time out (~35s) and both sides will fall back to
+the relay automatically:
+```
+[announce] hole punch timed out — falling back to relay...
+[relay] connecting to 34.68.99.198:443...
+[relay] waiting for peer...
+[relay] paired ✓
+[announce] Noise XX handshake (responder, via relay)...
+Connected to: WORD-NNNN-WORD-NNNN
+```
+
+Re-enable the firewall when done:
+```bash
+sudo pfctl -d
+```
+
+### 4.3 Two machines on different networks (recommended relay test)
+
+This is the most realistic test. Use one machine behind a **symmetric NAT** (some
+mobile hotspots, corporate VPNs, or certain ISP routers) where hole punching fails.
+
+**Machine A (sender):**
+```bash
+p2pshare send /tmp/test.txt
+# Share code: WORD-NNNN
+```
+
+**Machine B (receiver, on symmetric NAT):**
+```bash
+p2pshare receive WORD-NNNN
+```
+
+If Machine B's NAT is symmetric, you will see:
+```
+[connect] hole punching...
+# ... (waits ~35s) ...
+[connect] hole punch timed out — falling back to relay...
+[relay] connecting to 34.68.99.198:443...
+[relay] waiting for peer...
+[relay] paired ✓
+[connect] Noise XX handshake (initiator, via relay)...
+```
+
+On Machine A, the same fallback fires at the same time:
+```
+[announce] hole punch timed out — falling back to relay...
+[relay] connecting to 34.68.99.198:443...
+[relay] paired ✓
+[announce] Noise XX handshake (responder, via relay)...
+Connected to: WORD-NNNN-WORD-NNNN
+Sending /tmp/test.txt...
+```
+
+Verify the file arrived intact:
+```bash
+diff /tmp/test.txt /path/to/received/test.txt
+```
+
+### 4.4 Relay file transfer with integrity check
+
+```bash
+# Generate a 10MB test file
+dd if=/dev/urandom of=/tmp/relay_test.bin bs=1M count=10
+sha256sum /tmp/relay_test.bin  # record this hash
+
+# A: send
+p2pshare send /tmp/relay_test.bin
+
+# B: receive (after relay pairs)
+p2pshare receive WORD-NNNN --output /tmp/relay_received/
+
+# Verify integrity
+sha256sum /tmp/relay_received/relay_test.bin
+# Must match the hash recorded above
+```
+
+Note: the relay path sends chunks **sequentially** (no parallel QUIC streams) so
+throughput is lower than a direct connection — bounded by the round-trip latency to
+`34.68.99.198`. Correctness and integrity are identical.
+
+### 4.5 Relay server diagnostics
+
+Check the relay is running on the GCP VM:
+```bash
+ssh <user>@34.68.99.198 "sudo systemctl status p2pshare-relay"
+# or, if running directly:
+ssh <user>@34.68.99.198 "pgrep -a p2pshare-relay"
+```
+
+View live relay logs (if running with systemd):
+```bash
+ssh <user>@34.68.99.198 "sudo journalctl -u p2pshare-relay -f"
+```
+
+Each successful pairing logs:
+```
+INFO p2pshare_relay: piping session (token <hex>)
+INFO p2pshare_relay: session closed (token <hex>)
+```
+
+Unpaired connections (second peer never arrived) log:
+```
+INFO p2pshare_relay: <addr>: peer never arrived — closing
+```
+
+### 4.6 Confirm relay zero-knowledge property
+
+The relay forwards raw encrypted bytes. It has no way to read the contents because:
+
+- The Noise XX handshake (and all subsequent traffic) is encrypted **end-to-end**
+  between the two peers before any bytes reach the relay.
+- The relay's TCP stream only carries Noise ciphertext — without the session keys,
+  which never leave the peers' machines, the relay sees random bytes.
+
+To confirm: capture relay-side traffic with tcpdump and verify it is not plaintext:
+```bash
+# On the GCP VM (requires root)
+sudo tcpdump -i eth0 port 443 -X -c 200
+# Output should be unrecognisable binary — no filenames, no content visible
+```
+
+---
+
 ## Validation Matrix
 
 | Test | Command | Pass Criterion |
@@ -264,6 +439,11 @@ Each `send` generates a new share code and connection.
 | Resume | Kill + restart receiver | Only missing chunks retransferred |
 | Parallel streams | `send` large file | Progress shows multiple chunks per second |
 | NACK handling | (automatic) | Transfer completes even if SHA-256 mismatch triggers retry |
+| Relay server up | `nc -zv 34.68.99.198 443` | `Connection succeeded` in <2s |
+| Relay pairing | Two clients, same code | Both print `[relay] paired ✓` |
+| Relay Noise handshake | Relay transfer | Both sides print each other's fingerprint |
+| Relay file integrity | `send` + `receive` via relay | `sha256sum` hashes match |
+| Relay zero-knowledge | `tcpdump` on VM port 443 | No plaintext visible in capture |
 
 ---
 
@@ -284,6 +464,9 @@ cat ~/.config/p2pshare/identity.json
 ls -la ~/.config/p2pshare/transfers/
 ```
 
+**Tell if a transfer used the relay path:**
+Look for `[relay]` prefix lines in the output. Direct connections show `[announce]`/`[connect]` prefixes through the QUIC setup; relay connections show the fallback message then `[send/relay]` or `[recv/relay]` chunk progress.
+
 **Check contacts database:**
 ```bash
 sqlite3 ~/.config/p2pshare/contacts.db "SELECT display_name, fingerprint FROM contacts;"
@@ -291,11 +474,12 @@ sqlite3 ~/.config/p2pshare/contacts.db "SELECT display_name, fingerprint FROM co
 
 ---
 
-## Known Limitations (as of Phase 3)
+## Known Limitations (as of Phase 4)
 
 | Limitation | Phase fixed |
 |---|---|
-| Symmetric NAT (~20% of networks) causes hole punch timeout | Phase 4 (relay) |
+| ~~Symmetric NAT (~20% of networks) causes hole punch timeout~~ | ✓ Fixed (Phase 4 relay) |
+| Relay transfers are sequential (no parallel streams) — slower than direct | Acceptable for relay fallback |
 | Only one file per `send` command | Future |
 | No progress bar (only log lines) | Future |
 | Streaming mode (`video playback while receiving`) not implemented | Phase 8 |

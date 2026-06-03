@@ -6,16 +6,27 @@ use std::sync::{
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::task::JoinSet;
 
-use crate::{session::coordinator::PeerSession, Error, Result};
+use crate::{session::{coordinator::PeerSession, Session}, Error, Result};
 
-use super::manifest::{
-    build_manifest, parallel_streams_for, ChunkMeta, ControlMessage, FileManifest, TransferMode,
+use super::{
+    manifest::{build_manifest, parallel_streams_for, ChunkMeta, ControlMessage, FileManifest, TransferMode},
+    relay_sender::send_file_relay,
 };
 
 const MAX_BYTES_IN_FLIGHT: usize = 32 * 1024 * 1024; // 32MB
 
 /// Build manifest, negotiate with receiver, send all chunks, handle NACKs.
-pub async fn send_file(session: &PeerSession, file_path: &Path) -> Result<()> {
+///
+/// Works transparently over both direct QUIC (`Session::Direct`) and relay
+/// TCP (`Session::Relay`) connections.
+pub async fn send_file(session: &Session, file_path: &Path) -> Result<()> {
+    match session {
+        Session::Direct(s) => send_file_direct(s, file_path).await,
+        Session::Relay(s) => send_file_relay(s, file_path).await,
+    }
+}
+
+async fn send_file_direct(session: &PeerSession, file_path: &Path) -> Result<()> {
     // ── Build manifest ─────────────────────────────────────────────────────────
     eprintln!("[send] hashing {}...", file_path.display());
     let manifest = build_manifest(file_path).await?;

@@ -3,14 +3,25 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-use crate::{session::coordinator::PeerSession, Error, Result};
+use crate::{session::{coordinator::PeerSession, Session}, Error, Result};
 
 use super::manifest::{ControlMessage, TransferMode};
-use super::resume::{TransferState, find_resumable};
+use super::relay_receiver::receive_file_relay;
+use super::resume::{find_resumable, TransferState};
 
 /// Accept manifest, negotiate resume, receive all chunks, verify, write to `output_dir`.
 /// Returns the path of the completed file.
-pub async fn receive_file(session: &PeerSession, output_dir: &Path) -> Result<PathBuf> {
+///
+/// Works transparently over both direct QUIC (`Session::Direct`) and relay
+/// TCP (`Session::Relay`) connections.
+pub async fn receive_file(session: &Session, output_dir: &Path) -> Result<PathBuf> {
+    match session {
+        Session::Direct(s) => receive_file_direct(s, output_dir).await,
+        Session::Relay(s) => receive_file_relay(s, output_dir).await,
+    }
+}
+
+async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result<PathBuf> {
     // ── Accept control stream ──────────────────────────────────────────────────
     let (mut ctrl_send, mut ctrl_recv) = session
         .connection
@@ -148,8 +159,11 @@ mod tests {
     use super::*;
     use crate::{
         identity::keypair::Keypair,
-        nat::quic::{make_client_endpoint, make_server_endpoint, skip_verify_client_config},
-        session::coordinator::PeerSession,
+        nat::quic::{
+            make_client_endpoint, make_server_endpoint_with_config, prebuilt_server_config,
+            skip_verify_client_config,
+        },
+        session::{coordinator::PeerSession, Session},
         crypto::handshake::{perform_handshake, HandshakeRole},
         transfer::sender::send_file,
     };
@@ -188,7 +202,8 @@ mod tests {
         // QUIC endpoints
         let srv_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16)).await.unwrap();
         let srv_addr: SocketAddr = (Ipv4Addr::LOCALHOST, srv_sock.local_addr().unwrap().port()).into();
-        let srv_ep = make_server_endpoint(srv_sock.into_std().unwrap()).unwrap();
+        let srv_cfg = prebuilt_server_config().unwrap();
+        let srv_ep = make_server_endpoint_with_config(srv_sock.into_std().unwrap(), srv_cfg).unwrap();
 
         let cli_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16)).await.unwrap();
         let cli_ep = make_client_endpoint(cli_sock.into_std().unwrap()).unwrap();
@@ -207,7 +222,7 @@ mod tests {
             let conn = incoming.accept().unwrap().await.unwrap();
             let (mut s, mut r) = conn.accept_bi().await.unwrap();
             let hs = perform_handshake(&mut s, &mut r, &sender_privkey, HandshakeRole::Responder).await.unwrap();
-            let session = make_session(conn, hs.transport, hs.remote_pubkey);
+            let session = Session::Direct(make_session(conn, hs.transport, hs.remote_pubkey));
             send_file(&session, &src_clone).await.unwrap();
             hs.remote_pubkey  // return receiver's pubkey to verify
         });
@@ -216,7 +231,7 @@ mod tests {
         let conn = cli_ep.connect_with(cli_cfg, srv_addr, "p2pshare").unwrap().await.unwrap();
         let (mut s, mut r) = conn.open_bi().await.unwrap();
         let hs = perform_handshake(&mut s, &mut r, &receiver_privkey, HandshakeRole::Initiator).await.unwrap();
-        let session = make_session(conn, hs.transport, hs.remote_pubkey);
+        let session = Session::Direct(make_session(conn, hs.transport, hs.remote_pubkey));
         let out_path = receive_file(&session, &out_dir).await.unwrap();
 
         // Verify the sender task completed

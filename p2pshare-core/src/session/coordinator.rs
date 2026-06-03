@@ -16,9 +16,14 @@ use crate::{
     identity::{fingerprint::to_fingerprint, storage::UserIdentity},
     nat::{
         hole_punch::hole_punch,
-        quic::{make_client_endpoint, make_server_endpoint_with_config, prebuilt_server_config, skip_verify_client_config},
+        quic::{
+            make_client_endpoint, make_server_endpoint_with_config, prebuilt_server_config,
+            skip_verify_client_config,
+        },
+        relay::connect_via_relay,
         stun::external_addr,
     },
+    session::{relay_session::RelaySession, Session},
     transfer::manifest::ControlMessage,
     Error, Result,
 };
@@ -28,10 +33,7 @@ const CHUNK_NONCE_BASE: u64 = 1 << 32;
 
 // ── PeerSession ────────────────────────────────────────────────────────────────
 
-/// A connected, Noise-authenticated session with a remote peer.
-///
-/// `noise` uses `StatelessTransportState` so chunks can be encrypted with
-/// explicit per-chunk nonces (no ordering constraints).
+/// A connected, Noise-authenticated session with a remote peer over a direct QUIC connection.
 pub struct PeerSession {
     pub connection: quinn::Connection,
     pub remote_pubkey: [u8; 32],
@@ -149,11 +151,13 @@ impl PeerSession {
 // ── Sender / announcer side ────────────────────────────────────────────────────
 
 /// Generate a share code, announce on DHT, wait for receiver, handshake.
-/// Returns `(share_code, session)`.
+///
+/// Returns `(share_code, session)`. If hole punching fails the connection
+/// automatically falls back to the relay at `RELAY_ADDR`.
 pub async fn announce_and_connect(
     identity: &UserIdentity,
     dht: &DhtLayer,
-) -> Result<(String, PeerSession)> {
+) -> Result<(String, Session)> {
     // Generate TLS cert before any network work so it's ready the moment hole punch completes.
     let server_cfg = prebuilt_server_config()?;
 
@@ -172,6 +176,7 @@ pub async fn announce_and_connect(
         expires_in / 60,
         expires_in % 60
     );
+
     let announce_port = match external_addr(&socket).await {
         Some(ext) => {
             eprintln!("[announce] STUN: external address is {}", ext);
@@ -191,54 +196,96 @@ pub async fn announce_and_connect(
     eprintln!("[announce] receiver found at {}", receiver_addr);
 
     eprintln!("[announce] hole punching...");
-    hole_punch(socket.clone(), receiver_addr).await?;
-    eprintln!("[announce] QUIC server starting...");
+    match hole_punch(socket.clone(), receiver_addr).await {
+        Ok(()) => {
+            // ── Direct QUIC path ───────────────────────────────────────────────
+            eprintln!("[announce] QUIC server starting...");
+            let std_socket = Arc::try_unwrap(socket)
+                .map_err(|_| Error::ConnectionFailed("socket still borrowed".to_string()))?
+                .into_std()?;
+            let endpoint = make_server_endpoint_with_config(std_socket, server_cfg)?;
 
-    let std_socket = Arc::try_unwrap(socket)
-        .map_err(|_| Error::ConnectionFailed("socket still borrowed".to_string()))?
-        .into_std()?;
-    let endpoint = make_server_endpoint_with_config(std_socket, server_cfg)?;
+            let incoming = timeout(Duration::from_secs(15), endpoint.accept())
+                .await
+                .map_err(|_| {
+                    Error::ConnectionFailed("timed out waiting for QUIC connect".to_string())
+                })?
+                .ok_or_else(|| Error::ConnectionFailed("endpoint closed".to_string()))?;
 
-    let incoming = timeout(Duration::from_secs(15), endpoint.accept())
-        .await
-        .map_err(|_| Error::ConnectionFailed("timed out waiting for QUIC connect".to_string()))?
-        .ok_or_else(|| Error::ConnectionFailed("endpoint closed".to_string()))?;
+            let conn = incoming
+                .accept()
+                .map_err(|e| Error::Quic(e.to_string()))?
+                .await
+                .map_err(|e| Error::Quic(e.to_string()))?;
 
-    let conn = incoming
-        .accept()
-        .map_err(|e| Error::Quic(e.to_string()))?
-        .await
-        .map_err(|e| Error::Quic(e.to_string()))?;
+            eprintln!("[announce] Noise XX handshake (responder)...");
+            let (mut send, mut recv) = conn
+                .accept_bi()
+                .await
+                .map_err(|e| Error::Quic(e.to_string()))?;
 
-    eprintln!("[announce] Noise XX handshake (responder)...");
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| Error::Quic(e.to_string()))?;
+            let private_key = identity.private_key_bytes();
+            let hs =
+                perform_handshake(&mut send, &mut recv, &private_key, HandshakeRole::Responder)
+                    .await?;
+            let remote_fingerprint = to_fingerprint(&hs.remote_pubkey);
 
-    let private_key = identity.private_key_bytes();
-    let hs = perform_handshake(&mut send, &mut recv, &private_key, HandshakeRole::Responder).await?;
-    let remote_fingerprint = to_fingerprint(&hs.remote_pubkey);
+            let session = PeerSession {
+                connection: conn,
+                remote_pubkey: hs.remote_pubkey,
+                remote_fingerprint,
+                noise: Arc::new(Mutex::new(hs.transport)),
+                send_nonce: Arc::new(AtomicU64::new(0)),
+            };
 
-    let session = PeerSession {
-        connection: conn,
-        remote_pubkey: hs.remote_pubkey,
-        remote_fingerprint,
-        noise: Arc::new(Mutex::new(hs.transport)),
-        send_nonce: Arc::new(AtomicU64::new(0)),
-    };
+            Ok((code.display, Session::Direct(session)))
+        }
 
-    Ok((code.display, session))
+        Err(Error::HolePunchTimeout) => {
+            // ── Relay fallback ─────────────────────────────────────────────────
+            drop(socket);
+            drop(server_cfg);
+            eprintln!("[announce] hole punch timed out — falling back to relay...");
+
+            let tcp = connect_via_relay(&code.display).await?;
+            let (mut read_half, mut write_half) = tcp.into_split();
+
+            let private_key = identity.private_key_bytes();
+            eprintln!("[announce] Noise XX handshake (responder, via relay)...");
+            let hs = perform_handshake(
+                &mut write_half,
+                &mut read_half,
+                &private_key,
+                HandshakeRole::Responder,
+            )
+            .await?;
+            let remote_fingerprint = to_fingerprint(&hs.remote_pubkey);
+
+            let relay_session = RelaySession::from_split(
+                read_half,
+                write_half,
+                hs.remote_pubkey,
+                remote_fingerprint,
+                hs.transport,
+            );
+
+            Ok((code.display, Session::Relay(relay_session)))
+        }
+
+        Err(e) => Err(e),
+    }
 }
 
 // ── Receiver / connector side ─────────────────────────────────────────────────
 
 /// Look up a share code, back-announce, hole punch, handshake.
+///
+/// Falls back to the relay automatically if hole punching times out.
 pub async fn lookup_and_connect(
     identity: &UserIdentity,
     code: &str,
     dht: &DhtLayer,
-) -> Result<PeerSession> {
+) -> Result<Session> {
     let code = code.to_uppercase();
     let infohash_send = to_infohash(&code);
     let infohash_recv = to_recv_infohash(&code);
@@ -271,50 +318,87 @@ pub async fn lookup_and_connect(
     dht.announce(infohash_recv, announce_port).await;
 
     eprintln!("[connect] hole punching...");
-    hole_punch(socket.clone(), sender_addr).await?;
+    match hole_punch(socket.clone(), sender_addr).await {
+        Ok(()) => {
+            // ── Direct QUIC path ───────────────────────────────────────────────
+            // Our hole_punch completed (we got a punch from sender), but sender
+            // still needs to receive a punch from us to finish its own hole_punch
+            // and start the QUIC server. Keep punching until we hand the socket
+            // to QUIC (~600ms).
+            for _ in 0..10 {
+                let _ = socket.send_to(b"p2pshare-punch", sender_addr).await;
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
 
-    // Our hole_punch completed (we got a punch from sender), but sender still needs
-    // to receive a punch from us to finish its own hole_punch and start the QUIC server.
-    // Keep punching until we hand the socket to QUIC (~600ms).
-    for _ in 0..10 {
-        let _ = socket.send_to(b"p2pshare-punch", sender_addr).await;
-        tokio::time::sleep(Duration::from_millis(60)).await;
+            eprintln!("[connect] QUIC client connecting...");
+            let std_socket = Arc::try_unwrap(socket)
+                .map_err(|_| Error::ConnectionFailed("socket still borrowed".to_string()))?
+                .into_std()?;
+
+            let endpoint = make_client_endpoint(std_socket)?;
+            let client_cfg = skip_verify_client_config()?;
+
+            let conn = endpoint
+                .connect_with(client_cfg, sender_addr, "p2pshare")
+                .map_err(|e| Error::Quic(e.to_string()))?
+                .await
+                .map_err(|e| Error::Quic(e.to_string()))?;
+
+            eprintln!("[connect] Noise XX handshake (initiator)...");
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| Error::Quic(e.to_string()))?;
+
+            let private_key = identity.private_key_bytes();
+            let hs =
+                perform_handshake(&mut send, &mut recv, &private_key, HandshakeRole::Initiator)
+                    .await?;
+            let remote_fingerprint = to_fingerprint(&hs.remote_pubkey);
+
+            let session = PeerSession {
+                connection: conn,
+                remote_pubkey: hs.remote_pubkey,
+                remote_fingerprint,
+                noise: Arc::new(Mutex::new(hs.transport)),
+                send_nonce: Arc::new(AtomicU64::new(0)),
+            };
+
+            Ok(Session::Direct(session))
+        }
+
+        Err(Error::HolePunchTimeout) => {
+            // ── Relay fallback ─────────────────────────────────────────────────
+            drop(socket);
+            eprintln!("[connect] hole punch timed out — falling back to relay...");
+
+            let tcp = connect_via_relay(&code).await?;
+            let (mut read_half, mut write_half) = tcp.into_split();
+
+            let private_key = identity.private_key_bytes();
+            eprintln!("[connect] Noise XX handshake (initiator, via relay)...");
+            let hs = perform_handshake(
+                &mut write_half,
+                &mut read_half,
+                &private_key,
+                HandshakeRole::Initiator,
+            )
+            .await?;
+            let remote_fingerprint = to_fingerprint(&hs.remote_pubkey);
+
+            let relay_session = RelaySession::from_split(
+                read_half,
+                write_half,
+                hs.remote_pubkey,
+                remote_fingerprint,
+                hs.transport,
+            );
+
+            Ok(Session::Relay(relay_session))
+        }
+
+        Err(e) => Err(e),
     }
-
-    eprintln!("[connect] QUIC client connecting...");
-
-    let std_socket = Arc::try_unwrap(socket)
-        .map_err(|_| Error::ConnectionFailed("socket still borrowed".to_string()))?
-        .into_std()?;
-
-    let endpoint = make_client_endpoint(std_socket)?;
-    let client_cfg = skip_verify_client_config()?;
-
-    let conn = endpoint
-        .connect_with(client_cfg, sender_addr, "p2pshare")
-        .map_err(|e| Error::Quic(e.to_string()))?
-        .await
-        .map_err(|e| Error::Quic(e.to_string()))?;
-
-    eprintln!("[connect] Noise XX handshake (initiator)...");
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| Error::Quic(e.to_string()))?;
-
-    let private_key = identity.private_key_bytes();
-    let hs = perform_handshake(&mut send, &mut recv, &private_key, HandshakeRole::Initiator).await?;
-    let remote_fingerprint = to_fingerprint(&hs.remote_pubkey);
-
-    let session = PeerSession {
-        connection: conn,
-        remote_pubkey: hs.remote_pubkey,
-        remote_fingerprint,
-        noise: Arc::new(Mutex::new(hs.transport)),
-        send_nonce: Arc::new(AtomicU64::new(0)),
-    };
-
-    Ok(session)
 }
 
 // ── DHT polling ───────────────────────────────────────────────────────────────

@@ -152,7 +152,7 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
             let (_code, session) = announce_and_connect(&identity, &dht).await?;
 
             println!();
-            println!("Connected to: {}", session.remote_fingerprint);
+            println!("Connected to: {}", session.remote_fingerprint());
             println!("Sending {}...", file.display());
 
             send_file(&session, &file).await?;
@@ -171,7 +171,7 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
             let session = lookup_and_connect(&identity, &code, &dht).await?;
 
             println!();
-            println!("Connected to: {}", session.remote_fingerprint);
+            println!("Connected to: {}", session.remote_fingerprint());
             println!("Receiving...");
 
             let saved_to = receive_file(&session, &output).await?;
@@ -190,8 +190,8 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
 
             println!();
             println!("Share code used : {}", code);
-            println!("Remote peer     : {}", session.remote_fingerprint);
-            println!("Remote pubkey   : {}", hex::encode(session.remote_pubkey));
+            println!("Remote peer     : {}", session.remote_fingerprint());
+            println!("Remote pubkey   : {}", hex::encode(session.remote_pubkey()));
         }
 
         // ── Connect (Phase 2 handshake test) ──────────────────────────────────
@@ -205,8 +205,8 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
             let session = lookup_and_connect(&identity, &code, &dht).await?;
 
             println!();
-            println!("Remote peer   : {}", session.remote_fingerprint);
-            println!("Remote pubkey : {}", hex::encode(session.remote_pubkey));
+            println!("Remote peer   : {}", session.remote_fingerprint());
+            println!("Remote pubkey : {}", hex::encode(session.remote_pubkey()));
         }
 
         // ── Contacts ──────────────────────────────────────────────────────────

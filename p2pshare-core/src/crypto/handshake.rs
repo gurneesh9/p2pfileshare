@@ -1,5 +1,5 @@
-use quinn::{RecvStream, SendStream};
 use snow::{Builder, StatelessTransportState};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{Error, Result};
 
@@ -19,17 +19,25 @@ pub struct HandshakeResult {
     pub transport: StatelessTransportState,
 }
 
-/// Perform a Noise XX handshake over an open QUIC bidirectional stream.
+/// Perform a Noise XX handshake over any bidirectional byte stream.
 ///
-/// Each Noise handshake message is framed with a 2-byte big-endian length prefix.
+/// Works with QUIC streams (`quinn::SendStream` / `quinn::RecvStream`) and TCP
+/// halves (`tokio::net::tcp::OwnedWriteHalf` / `OwnedReadHalf`) — both implement
+/// `AsyncWrite + Unpin` and `AsyncRead + Unpin` respectively.
+///
+/// Each Noise message is framed with a 2-byte big-endian length prefix.
 /// After the handshake, `into_stateless_transport_mode` is used so chunks can be
-/// encrypted with explicit nonces (chunk_index) independently of message ordering.
-pub async fn perform_handshake(
-    send: &mut SendStream,
-    recv: &mut RecvStream,
+/// encrypted with explicit nonces independently of message ordering.
+pub async fn perform_handshake<W, R>(
+    send: &mut W,
+    recv: &mut R,
     local_static_key: &[u8; 32],
     role: HandshakeRole,
-) -> Result<HandshakeResult> {
+) -> Result<HandshakeResult>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     let params = NOISE_PARAMS
         .parse()
         .map_err(|e: snow::Error| Error::Noise(e.to_string()))?;
@@ -72,13 +80,13 @@ pub async fn perform_handshake(
 
 // ── Framing helpers ────────────────────────────────────────────────────────────
 
-async fn send_framed(send: &mut SendStream, msg: &[u8]) -> Result<()> {
+async fn send_framed<W: AsyncWrite + Unpin>(send: &mut W, msg: &[u8]) -> Result<()> {
     send.write_all(&(msg.len() as u16).to_be_bytes()).await?;
     send.write_all(msg).await?;
     Ok(())
 }
 
-async fn recv_framed(recv: &mut RecvStream) -> Result<Vec<u8>> {
+async fn recv_framed<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 2];
     recv.read_exact(&mut len_buf).await?;
     let len = u16::from_be_bytes(len_buf) as usize;
@@ -94,7 +102,10 @@ mod tests {
     use super::*;
     use crate::{
         identity::keypair::Keypair,
-        nat::quic::{make_client_endpoint, make_server_endpoint, skip_verify_client_config},
+        nat::quic::{
+            make_client_endpoint, make_server_endpoint_with_config, prebuilt_server_config,
+            skip_verify_client_config,
+        },
     };
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio::net::UdpSocket;
@@ -107,7 +118,8 @@ mod tests {
         let srv_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16)).await.unwrap();
         let srv_addr: SocketAddr =
             (Ipv4Addr::LOCALHOST, srv_sock.local_addr().unwrap().port()).into();
-        let srv_endpoint = make_server_endpoint(srv_sock.into_std().unwrap()).unwrap();
+        let srv_cfg = prebuilt_server_config().unwrap();
+        let srv_endpoint = make_server_endpoint_with_config(srv_sock.into_std().unwrap(), srv_cfg).unwrap();
 
         let cli_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16)).await.unwrap();
         let cli_endpoint = make_client_endpoint(cli_sock.into_std().unwrap()).unwrap();

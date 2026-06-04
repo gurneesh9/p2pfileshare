@@ -4,10 +4,13 @@ use clap::{Parser, Subcommand};
 use p2pshare_core::{
     contacts::{model::Contact, store::ContactStore},
     discovery::dht::DhtLayer,
-    identity::storage::{load_or_create, reset, save},
-    session::coordinator::{announce_and_connect, lookup_and_connect},
+    identity::storage::{load, reset, save},
+    session::coordinator::{
+        announce_and_connect, announce_via_relay_only, connect_via_relay_only, lookup_and_connect,
+    },
     transfer::{receiver::receive_file, sender::send_file},
 };
+// Session is used via the return types of announce_and_connect / lookup_and_connect
 
 #[derive(Parser)]
 #[command(name = "p2pshare", about = "Decentralized encrypted file transfer")]
@@ -31,6 +34,9 @@ enum Command {
     Send {
         /// File to send
         file: PathBuf,
+        /// Skip LAN discovery and DHT — connect straight through the relay server
+        #[arg(long)]
+        relay: bool,
     },
 
     /// Look up a share code and receive the file from the sender
@@ -40,6 +46,9 @@ enum Command {
         /// Directory to save the received file (default: current directory)
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
+        /// Skip LAN discovery and DHT — connect straight through the relay server
+        #[arg(long)]
+        relay: bool,
     },
 
     /// Look up a share code on the DHT and print the resolved peer address (no connection)
@@ -89,6 +98,20 @@ async fn main() {
     }
 }
 
+fn load_identity_or_exit() -> p2pshare_core::identity::storage::UserIdentity {
+    match load() {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            println!("key not found");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error loading identity: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn run(cli: Cli) -> p2pshare_core::Result<()> {
     match cli.command {
         // ── Identity ──────────────────────────────────────────────────────────
@@ -97,7 +120,7 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
                 eprintln!("Regenerating identity...");
                 reset()?
             } else {
-                load_or_create(None)?
+                load_identity_or_exit()
             };
             if let Some(n) = name {
                 identity.display_name = n;
@@ -139,20 +162,24 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
         }
 
         // ── Send ──────────────────────────────────────────────────────────────
-        Command::Send { file } => {
+        Command::Send { file, relay } => {
             if !file.exists() {
                 eprintln!("error: file not found: {}", file.display());
                 std::process::exit(1);
             }
-            let identity = load_or_create(None)?;
-            let dht = DhtLayer::new()?;
+            let identity = load_identity_or_exit();
 
             println!("Your fingerprint: {}", identity.fingerprint);
 
-            let (_code, session) = announce_and_connect(&identity, &dht).await?;
+            let (_code, session) = if relay {
+                announce_via_relay_only(&identity).await?
+            } else {
+                let dht = DhtLayer::new()?;
+                announce_and_connect(&identity, &dht).await?
+            };
 
             println!();
-            println!("Connected to: {}", session.remote_fingerprint);
+            println!("Connected to: {}", session.remote_fingerprint());
             println!("Sending {}...", file.display());
 
             send_file(&session, &file).await?;
@@ -161,17 +188,21 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
         }
 
         // ── Receive ───────────────────────────────────────────────────────────
-        Command::Receive { code, output } => {
-            let identity = load_or_create(None)?;
-            let dht = DhtLayer::new()?;
+        Command::Receive { code, output, relay } => {
+            let identity = load_identity_or_exit();
 
             println!("Your fingerprint: {}", identity.fingerprint);
             println!("Connecting via code: {}", code.to_uppercase());
 
-            let session = lookup_and_connect(&identity, &code, &dht).await?;
+            let session = if relay {
+                connect_via_relay_only(&identity, &code).await?
+            } else {
+                let dht = DhtLayer::new()?;
+                lookup_and_connect(&identity, &code, &dht).await?
+            };
 
             println!();
-            println!("Connected to: {}", session.remote_fingerprint);
+            println!("Connected to: {}", session.remote_fingerprint());
             println!("Receiving...");
 
             let saved_to = receive_file(&session, &output).await?;
@@ -181,7 +212,7 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
 
         // ── Announce (Phase 2 handshake test) ─────────────────────────────────
         Command::Announce => {
-            let identity = load_or_create(None)?;
+            let identity = load_identity_or_exit();
             let dht = DhtLayer::new()?;
 
             println!("Your fingerprint: {}", identity.fingerprint);
@@ -190,13 +221,13 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
 
             println!();
             println!("Share code used : {}", code);
-            println!("Remote peer     : {}", session.remote_fingerprint);
-            println!("Remote pubkey   : {}", hex::encode(session.remote_pubkey));
+            println!("Remote peer     : {}", session.remote_fingerprint());
+            println!("Remote pubkey   : {}", hex::encode(session.remote_pubkey()));
         }
 
         // ── Connect (Phase 2 handshake test) ──────────────────────────────────
         Command::Connect { code } => {
-            let identity = load_or_create(None)?;
+            let identity = load_identity_or_exit();
             let dht = DhtLayer::new()?;
 
             println!("Your fingerprint: {}", identity.fingerprint);
@@ -205,8 +236,8 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
             let session = lookup_and_connect(&identity, &code, &dht).await?;
 
             println!();
-            println!("Remote peer   : {}", session.remote_fingerprint);
-            println!("Remote pubkey : {}", hex::encode(session.remote_pubkey));
+            println!("Remote peer   : {}", session.remote_fingerprint());
+            println!("Remote pubkey : {}", hex::encode(session.remote_pubkey()));
         }
 
         // ── Contacts ──────────────────────────────────────────────────────────

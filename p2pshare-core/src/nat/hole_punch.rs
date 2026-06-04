@@ -12,7 +12,7 @@ use crate::{Error, Result};
 const PUNCH_MAGIC: &[u8] = b"p2pshare-punch";
 const PUNCH_INTERVAL_MS: u64 = 200;
 const PUNCH_COUNT: usize = 150; // 30s of punching — covers DHT propagation delay
-const PUNCH_TIMEOUT_SECS: u64 = 35;
+const PUNCH_TIMEOUT_SECS: u64 = 5;
 
 /// Simultaneously punch a hole toward `peer_addr` and wait to receive a punch back.
 ///

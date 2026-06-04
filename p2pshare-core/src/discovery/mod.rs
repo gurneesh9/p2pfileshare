@@ -1,4 +1,5 @@
 pub mod dht;
+pub mod mdns;
 pub mod presence;
 pub mod share_code;
 

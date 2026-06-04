@@ -30,6 +30,7 @@ snow   = "0.9"
 
 # Phase 3 — file transfer
 rmp-serde = "1"
+mdns-sd = "0.20"
 
 [dev-dependencies]
 tempfile = "3"

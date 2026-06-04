@@ -5,7 +5,9 @@ use p2pshare_core::{
     contacts::{model::Contact, store::ContactStore},
     discovery::dht::DhtLayer,
     identity::storage::{load, reset, save},
-    session::coordinator::{announce_and_connect, lookup_and_connect},
+    session::coordinator::{
+        announce_and_connect, announce_via_relay_only, connect_via_relay_only, lookup_and_connect,
+    },
     transfer::{receiver::receive_file, sender::send_file},
 };
 // Session is used via the return types of announce_and_connect / lookup_and_connect
@@ -32,6 +34,9 @@ enum Command {
     Send {
         /// File to send
         file: PathBuf,
+        /// Skip LAN discovery and DHT — connect straight through the relay server
+        #[arg(long)]
+        relay: bool,
     },
 
     /// Look up a share code and receive the file from the sender
@@ -41,6 +46,9 @@ enum Command {
         /// Directory to save the received file (default: current directory)
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
+        /// Skip LAN discovery and DHT — connect straight through the relay server
+        #[arg(long)]
+        relay: bool,
     },
 
     /// Look up a share code on the DHT and print the resolved peer address (no connection)
@@ -154,17 +162,21 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
         }
 
         // ── Send ──────────────────────────────────────────────────────────────
-        Command::Send { file } => {
+        Command::Send { file, relay } => {
             if !file.exists() {
                 eprintln!("error: file not found: {}", file.display());
                 std::process::exit(1);
             }
             let identity = load_identity_or_exit();
-            let dht = DhtLayer::new()?;
 
             println!("Your fingerprint: {}", identity.fingerprint);
 
-            let (_code, session) = announce_and_connect(&identity, &dht).await?;
+            let (_code, session) = if relay {
+                announce_via_relay_only(&identity).await?
+            } else {
+                let dht = DhtLayer::new()?;
+                announce_and_connect(&identity, &dht).await?
+            };
 
             println!();
             println!("Connected to: {}", session.remote_fingerprint());
@@ -176,14 +188,18 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
         }
 
         // ── Receive ───────────────────────────────────────────────────────────
-        Command::Receive { code, output } => {
+        Command::Receive { code, output, relay } => {
             let identity = load_identity_or_exit();
-            let dht = DhtLayer::new()?;
 
             println!("Your fingerprint: {}", identity.fingerprint);
             println!("Connecting via code: {}", code.to_uppercase());
 
-            let session = lookup_and_connect(&identity, &code, &dht).await?;
+            let session = if relay {
+                connect_via_relay_only(&identity, &code).await?
+            } else {
+                let dht = DhtLayer::new()?;
+                lookup_and_connect(&identity, &code, &dht).await?
+            };
 
             println!();
             println!("Connected to: {}", session.remote_fingerprint());

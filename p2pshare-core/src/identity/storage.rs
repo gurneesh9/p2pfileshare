@@ -1,11 +1,20 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::Result;
 
 use super::fingerprint::to_fingerprint;
 use super::keypair::Keypair;
+
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Override the directory where identity and contacts are stored.
+/// Call this once at startup with the platform-correct writable path.
+pub fn set_data_dir(path: impl Into<PathBuf>) {
+    let _ = DATA_DIR.set(path.into());
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserIdentity {
@@ -29,6 +38,11 @@ impl UserIdentity {
 }
 
 pub fn config_dir() -> PathBuf {
+    // If Flutter has set a platform-correct data dir, use it.
+    if let Some(dir) = DATA_DIR.get() {
+        return dir.clone();
+    }
+    // Fallback for desktop: ~/.config/p2pshare
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".config").join("p2pshare")
 }

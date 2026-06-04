@@ -7,7 +7,10 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout};
 
+use sha1::{Digest, Sha1};
+
 use crate::{
+    contacts::model::Contact,
     crypto::handshake::{perform_handshake, HandshakeRole},
     discovery::{
         dht::DhtLayer,
@@ -496,4 +499,121 @@ async fn poll_for_receiver(
         }
         sleep(Duration::from_millis(1500)).await;
     }
+}
+
+// ── Contact-based connection ───────────────────────────────────────────────────
+
+/// Connect to a known contact.
+///
+/// Fast path: use `contact.last_known_addr` if cached.
+/// Slow path: DHT lookup by `SHA1(pubkey)`, then hole punch (relay fallback).
+/// Identity is verified post-handshake — rejects anyone whose pubkey mismatches.
+pub async fn connect_to_contact(
+    identity: &UserIdentity,
+    contact: &Contact,
+    dht: &DhtLayer,
+) -> Result<Session> {
+    let private_key = identity.private_key_bytes();
+
+    let expected_pubkey: [u8; 32] = hex::decode(&contact.public_key)
+        .map_err(|_| Error::ConnectionFailed("invalid contact public key".into()))?
+        .try_into()
+        .map_err(|_| Error::ConnectionFailed("public key wrong length".into()))?;
+
+    // Resolve peer address: cached first, then DHT.
+    let peer_addr: SocketAddr = if let Some(ref addr_str) = contact.last_known_addr {
+        match addr_str.parse::<SocketAddr>() {
+            Ok(addr) => {
+                eprintln!("[contact] using cached address {} for {}", addr, contact.display_name);
+                addr
+            }
+            Err(_) => lookup_contact_on_dht(&contact.public_key, dht).await?,
+        }
+    } else {
+        lookup_contact_on_dht(&contact.public_key, dht).await?
+    };
+
+    eprintln!("[contact] connecting to {} at {}", contact.display_name, peer_addr);
+
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let local_port = socket.local_addr()?.port();
+    let socket = Arc::new(socket);
+
+    let announce_port = match external_addr(&socket).await {
+        Some(ext) => ext.port(),
+        None => local_port,
+    };
+
+    // Announce ourselves on the contact's recv infohash so they can find us for back-punch.
+    let pk_bytes = hex::decode(&contact.public_key).unwrap_or_default();
+    let contact_infohash: [u8; 20] = Sha1::digest(&pk_bytes).into();
+    dht.announce(contact_infohash, announce_port).await;
+
+    match hole_punch(socket.clone(), peer_addr).await {
+        Ok(()) => {
+            for _ in 0..10 {
+                let _ = socket.send_to(b"p2pshare-punch", peer_addr).await;
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+
+            let std_socket = Arc::try_unwrap(socket)
+                .map_err(|_| Error::ConnectionFailed("socket still borrowed".into()))?
+                .into_std()?;
+            let ep = make_client_endpoint(std_socket)?;
+            let cfg = skip_verify_client_config()?;
+
+            let conn = ep
+                .connect_with(cfg, peer_addr, "p2pshare")
+                .map_err(|e| Error::Quic(e.to_string()))?
+                .await
+                .map_err(|e| Error::Quic(e.to_string()))?;
+
+            let (mut send, mut recv) = conn.open_bi().await.map_err(|e| Error::Quic(e.to_string()))?;
+            let hs = perform_handshake(&mut send, &mut recv, &private_key, HandshakeRole::Initiator).await?;
+
+            // Verify identity — reject if pubkey doesn't match contact's stored key.
+            if hs.remote_pubkey != expected_pubkey {
+                return Err(Error::ConnectionFailed(format!(
+                    "identity mismatch: expected {} but got {}",
+                    contact.fingerprint,
+                    to_fingerprint(&hs.remote_pubkey),
+                )));
+            }
+
+            eprintln!("[contact] connected and verified: {}", contact.display_name);
+            Ok(Session::Direct(make_peer_session(conn, hs.remote_pubkey, hs.transport)))
+        }
+
+        Err(Error::HolePunchTimeout) => {
+            drop(socket);
+            eprintln!("[contact] hole punch failed — falling back to relay...");
+            // For contact connections we use the contact fingerprint as the relay pairing token.
+            let tcp = connect_via_relay(&contact.fingerprint).await?;
+            let (mut rh, mut wh) = tcp.into_split();
+            let hs = perform_handshake(&mut wh, &mut rh, &private_key, HandshakeRole::Initiator).await?;
+
+            if hs.remote_pubkey != expected_pubkey {
+                return Err(Error::ConnectionFailed("identity mismatch on relay".into()));
+            }
+
+            let fingerprint = to_fingerprint(&hs.remote_pubkey);
+            eprintln!("[contact] relay: connected to {}", fingerprint);
+            Ok(Session::Relay(RelaySession::from_split(rh, wh, hs.remote_pubkey, fingerprint, hs.transport)))
+        }
+
+        Err(e) => Err(e),
+    }
+}
+
+async fn lookup_contact_on_dht(public_key_hex: &str, dht: &DhtLayer) -> Result<SocketAddr> {
+    let pk_bytes = hex::decode(public_key_hex)
+        .map_err(|_| Error::ConnectionFailed("bad public key hex".into()))?;
+    let infohash: [u8; 20] = Sha1::digest(&pk_bytes).into();
+
+    eprintln!("[contact] DHT lookup by pubkey...");
+    let peers = dht
+        .lookup_with_retry(infohash, Duration::from_secs(20), Duration::from_secs(2))
+        .await;
+
+    peers.into_iter().next().ok_or(Error::PeerNotFound)
 }

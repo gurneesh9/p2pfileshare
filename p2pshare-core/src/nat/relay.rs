@@ -9,15 +9,14 @@ use tokio::{
 
 use crate::{Error, Result};
 
+const DEFAULT_RELAY: &str = "34.61.29.61:443";
+
 pub fn relay_addr() -> &'static str {
     static ADDR: OnceLock<String> = OnceLock::new();
     ADDR.get_or_init(|| {
         match std::env::var("RELAY_ADDR") {
             Ok(val) if !val.trim().is_empty() => val,
-            _ => {
-                println!("RELAY_ADDR Not found");
-                std::process::exit(1);
-            }
+            _ => DEFAULT_RELAY.to_string(),
         }
     })
 }

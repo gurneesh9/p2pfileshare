@@ -13,3 +13,5 @@ Cargo.lock
 
 # Dev identity and local data (never commit private keys)
 ~/.config/p2pshare/
+
+p2pshare-UI/

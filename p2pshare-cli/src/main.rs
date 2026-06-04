@@ -4,10 +4,11 @@ use clap::{Parser, Subcommand};
 use p2pshare_core::{
     contacts::{model::Contact, store::ContactStore},
     discovery::dht::DhtLayer,
-    identity::storage::{load_or_create, reset, save},
+    identity::storage::{load, reset, save},
     session::coordinator::{announce_and_connect, lookup_and_connect},
     transfer::{receiver::receive_file, sender::send_file},
 };
+// Session is used via the return types of announce_and_connect / lookup_and_connect
 
 #[derive(Parser)]
 #[command(name = "p2pshare", about = "Decentralized encrypted file transfer")]
@@ -89,6 +90,20 @@ async fn main() {
     }
 }
 
+fn load_identity_or_exit() -> p2pshare_core::identity::storage::UserIdentity {
+    match load() {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            println!("key not found");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error loading identity: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn run(cli: Cli) -> p2pshare_core::Result<()> {
     match cli.command {
         // ── Identity ──────────────────────────────────────────────────────────
@@ -97,7 +112,7 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
                 eprintln!("Regenerating identity...");
                 reset()?
             } else {
-                load_or_create(None)?
+                load_identity_or_exit()
             };
             if let Some(n) = name {
                 identity.display_name = n;
@@ -144,7 +159,7 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
                 eprintln!("error: file not found: {}", file.display());
                 std::process::exit(1);
             }
-            let identity = load_or_create(None)?;
+            let identity = load_identity_or_exit();
             let dht = DhtLayer::new()?;
 
             println!("Your fingerprint: {}", identity.fingerprint);
@@ -162,7 +177,7 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
 
         // ── Receive ───────────────────────────────────────────────────────────
         Command::Receive { code, output } => {
-            let identity = load_or_create(None)?;
+            let identity = load_identity_or_exit();
             let dht = DhtLayer::new()?;
 
             println!("Your fingerprint: {}", identity.fingerprint);
@@ -181,7 +196,7 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
 
         // ── Announce (Phase 2 handshake test) ─────────────────────────────────
         Command::Announce => {
-            let identity = load_or_create(None)?;
+            let identity = load_identity_or_exit();
             let dht = DhtLayer::new()?;
 
             println!("Your fingerprint: {}", identity.fingerprint);
@@ -196,7 +211,7 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
 
         // ── Connect (Phase 2 handshake test) ──────────────────────────────────
         Command::Connect { code } => {
-            let identity = load_or_create(None)?;
+            let identity = load_identity_or_exit();
             let dht = DhtLayer::new()?;
 
             println!("Your fingerprint: {}", identity.fingerprint);

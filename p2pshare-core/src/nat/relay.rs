@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -8,7 +9,18 @@ use tokio::{
 
 use crate::{Error, Result};
 
-pub const RELAY_ADDR: &str = "34.172.20.38:443";
+pub fn relay_addr() -> &'static str {
+    static ADDR: OnceLock<String> = OnceLock::new();
+    ADDR.get_or_init(|| {
+        match std::env::var("RELAY_ADDR") {
+            Ok(val) if !val.trim().is_empty() => val,
+            _ => {
+                println!("RELAY_ADDR Not found");
+                std::process::exit(1);
+            }
+        }
+    })
+}
 
 /// Derive a 16-byte pairing token from the share code.
 /// Both the sender and receiver compute the same token independently,
@@ -22,9 +34,10 @@ pub fn relay_token_for(code: &str) -> [u8; 16] {
 /// Returns the TCP stream once pairing is signalled by the relay.
 pub async fn connect_via_relay(code: &str) -> Result<TcpStream> {
     let token = relay_token_for(code);
+    let addr = relay_addr();
 
-    eprintln!("[relay] connecting to {}...", RELAY_ADDR);
-    let mut stream = TcpStream::connect(RELAY_ADDR)
+    eprintln!("[relay] connecting to {}...", addr);
+    let mut stream = TcpStream::connect(addr)
         .await
         .map_err(|e| Error::ConnectionFailed(format!("relay connect: {e}")))?;
 
@@ -47,3 +60,16 @@ pub async fn connect_via_relay(code: &str) -> Result<TcpStream> {
     eprintln!("[relay] paired ✓");
     Ok(stream)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_relay_addr() {
+        std::env::set_var("RELAY_ADDR", "127.0.0.1:1234");
+        let addr = relay_addr();
+        assert_eq!(addr, "127.0.0.1:1234");
+    }
+}
+

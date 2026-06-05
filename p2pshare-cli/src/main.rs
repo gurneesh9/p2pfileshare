@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use p2pshare_core::{
+use xend_core::{
     contacts::{model::Contact, store::ContactStore},
     discovery::dht::DhtLayer,
     identity::storage::{load, reset, save},
@@ -13,7 +13,7 @@ use p2pshare_core::{
 // Session is used via the return types of announce_and_connect / lookup_and_connect
 
 #[derive(Parser)]
-#[command(name = "p2pshare", about = "Decentralized encrypted file transfer")]
+#[command(name = "xend", about = "Decentralized encrypted file transfer")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -88,7 +88,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("p2pshare=info".parse().unwrap()),
+                .add_directive("xend_core=info".parse().unwrap()),
         )
         .init();
 
@@ -98,7 +98,7 @@ async fn main() {
     }
 }
 
-fn load_identity_or_exit() -> p2pshare_core::identity::storage::UserIdentity {
+fn load_identity_or_exit() -> xend_core::identity::storage::UserIdentity {
     match load() {
         Ok(Some(id)) => id,
         Ok(None) => {
@@ -112,7 +112,7 @@ fn load_identity_or_exit() -> p2pshare_core::identity::storage::UserIdentity {
     }
 }
 
-async fn run(cli: Cli) -> p2pshare_core::Result<()> {
+async fn run(cli: Cli) -> xend_core::Result<()> {
     match cli.command {
         // ── Identity ──────────────────────────────────────────────────────────
         Command::Identity { name, reset: do_reset } => {
@@ -134,7 +134,7 @@ async fn run(cli: Cli) -> p2pshare_core::Result<()> {
 
         // ── Lookup (DHT only, no connection) ─────────────────────────────────
         Command::Lookup { code } => {
-            use p2pshare_core::discovery::share_code::to_infohash;
+            use xend_core::discovery::share_code::to_infohash;
             use std::time::Duration;
 
             let code = code.to_uppercase();

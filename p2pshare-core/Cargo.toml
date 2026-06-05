@@ -1,11 +1,11 @@
 [package]
-name = "p2pshare-core"
+name = "xend-core"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-# cdylib  → produces libp2pshare_core.dylib / .so / .dll (FRB native FFI)
-# lib     → keeps the normal .rlib for p2pshare-cli and tests
+# cdylib  → produces libxend_core.dylib / .so / .dll (FRB native FFI)
+# lib     → keeps the normal .rlib for xend-cli and tests
 crate-type = ["cdylib", "lib"]
 
 [dependencies]

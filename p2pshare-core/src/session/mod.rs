@@ -2,7 +2,8 @@ pub mod coordinator;
 pub mod relay_session;
 
 pub use coordinator::{
-    announce_and_connect, announce_via_relay_only, connect_to_contact, connect_via_relay_only,
+    announce_and_connect, announce_and_connect_with_code, announce_via_relay_only,
+    announce_via_relay_only_with_code, connect_to_contact, connect_via_relay_only,
     lookup_and_connect, PeerSession,
 };
 pub use relay_session::RelaySession;

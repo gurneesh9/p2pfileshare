@@ -18,12 +18,14 @@ use crate::{
     discovery::{
         dht::DhtLayer,
         presence::{check_presence, PresenceStatus},
+        share_code::generate_share_code,
     },
     identity::storage::{load, reset, save},
     session::{
         coordinator::{
-            announce_and_connect, announce_via_relay_only, connect_to_contact,
-            connect_via_relay_only, lookup_and_connect,
+            announce_and_connect, announce_and_connect_with_code, announce_via_relay_only,
+            announce_via_relay_only_with_code, connect_to_contact, connect_via_relay_only,
+            lookup_and_connect,
         },
         Session,
     },
@@ -208,6 +210,43 @@ pub async fn api_check_presence() -> Vec<ApiContact> {
             }
         })
         .collect()
+}
+
+// ── Two-phase send flow ───────────────────────────────────────────────────────
+// Phase 1: generate a code immediately so it can be displayed to the user.
+// Phase 2: announce with that code, wait for peer, return handle.
+// Phase 3: drive transfer with api_drive_send.
+
+/// Generate a share code without starting any network activity.
+/// Call this first so the code can be shown immediately.
+#[frb(sync)]
+pub fn api_generate_share_code() -> String {
+    generate_share_code().display
+}
+
+/// Phase 2 of send — full flow (LAN mDNS + DHT + relay fallback).
+/// Blocks until a receiver connects with the given code.
+pub async fn api_begin_send(code: String) -> Result<u64, String> {
+    let identity = load()
+        .map_err(|e| e.to_string())?
+        .ok_or("no identity")?;
+    let dht = DhtLayer::new().map_err(|e| e.to_string())?;
+    let session = announce_and_connect_with_code(&identity, &dht, &code)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(store_session(session))
+}
+
+/// Phase 2 of send — relay-only (no LAN/DHT).
+/// Blocks until a receiver connects via relay with the given code.
+pub async fn api_begin_send_relay_only(code: String) -> Result<u64, String> {
+    let identity = load()
+        .map_err(|e| e.to_string())?
+        .ok_or("no identity")?;
+    let session = announce_via_relay_only_with_code(&identity, &code)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(store_session(session))
 }
 
 // ── Send flow ─────────────────────────────────────────────────────────────────

@@ -167,12 +167,23 @@ pub async fn announce_and_connect(
     dht: &DhtLayer,
 ) -> Result<(String, Session)> {
     let code = generate_share_code();
+    let session = announce_and_connect_with_code(identity, dht, &code.display).await?;
+    Ok((code.display, session))
+}
+
+/// Same as `announce_and_connect` but uses a pre-generated share code so the
+/// code can be displayed to the user before waiting for a peer.
+pub async fn announce_and_connect_with_code(
+    identity: &UserIdentity,
+    dht: &DhtLayer,
+    code: &str,
+) -> Result<Session> {
     let private_key = identity.private_key_bytes();
     let expires_in = secs_until_expiry();
 
     eprintln!(
         "[announce] share code: {}  (expires in {}m {}s)",
-        code.display,
+        code,
         expires_in / 60,
         expires_in % 60
     );
@@ -183,7 +194,7 @@ pub async fn announce_and_connect(
     let lan_port = lan_std_socket.local_addr()?.port();
     let lan_ep = make_server_endpoint_with_config(lan_std_socket, lan_server_cfg)?;
 
-    let _mdns = match mdns::advertise(&code.display, lan_port) {
+    let _mdns = match mdns::advertise(code, lan_port) {
         Ok(ad) => Some(ad),
         Err(e) => {
             eprintln!("[announce] mDNS unavailable ({e}) — LAN discovery disabled");
@@ -197,8 +208,8 @@ pub async fn announce_and_connect(
     let local_port = punch_socket.local_addr()?.port();
     let punch_socket = Arc::new(punch_socket);
 
-    let infohash_send = to_infohash(&code.display);
-    let infohash_recv = to_recv_infohash(&code.display);
+    let infohash_send = to_infohash(code);
+    let infohash_recv = to_recv_infohash(code);
 
     let announce_port = match external_addr(&punch_socket).await {
         Some(ext) => {
@@ -216,7 +227,7 @@ pub async fn announce_and_connect(
     eprintln!("[announce] waiting for receiver (LAN or internet)...");
 
     // ── Race: first connection wins ─────────────────────────────────────────────
-    let code_display = code.display.clone();
+    let code_display = code.to_string();
 
     let session = tokio::select! {
         // LAN path — accept direct QUIC connections from mDNS-discovered peers.
@@ -295,7 +306,7 @@ pub async fn announce_and_connect(
         } => result?,
     };
 
-    Ok((code.display, session))
+    Ok(session)
 }
 
 // ── Receiver side ──────────────────────────────────────────────────────────────
@@ -319,11 +330,11 @@ pub async fn lookup_and_connect(
     eprintln!("[connect] looking up {} (LAN + internet simultaneously)...", code_upper);
 
     let session = tokio::select! {
-        // LAN path — browse mDNS for up to 3 s, then connect directly.
+        // LAN path — browse mDNS for up to 6 s, then connect directly.
         // On any error the branch is disabled and internet path continues.
         Ok(session) = async {
             let sender_addr = timeout(
-                Duration::from_secs(3),
+                Duration::from_secs(6),
                 mdns::browse_for_code(&code_upper),
             )
             .await
@@ -351,7 +362,9 @@ pub async fn lookup_and_connect(
         } => session,
 
         // Internet path — DHT lookup + back-announce + hole punch (relay fallback).
+        // Brief initial delay so LAN mDNS has a chance to win on same-network transfers.
         result = async {
+            sleep(Duration::from_millis(800)).await;
             let sender_addr = dht
                 .lookup(infohash_send)
                 .await
@@ -433,27 +446,24 @@ pub async fn lookup_and_connect(
 /// Skips DHT and hole punching entirely — use when `--relay` is passed explicitly.
 pub async fn announce_via_relay_only(identity: &UserIdentity) -> Result<(String, Session)> {
     let code = generate_share_code();
+    let session = announce_via_relay_only_with_code(identity, &code.display).await?;
+    Ok((code.display, session))
+}
+
+/// Same as `announce_via_relay_only` but uses a pre-generated code.
+pub async fn announce_via_relay_only_with_code(
+    identity: &UserIdentity,
+    code: &str,
+) -> Result<Session> {
     let private_key = identity.private_key_bytes();
-    let expires_in = secs_until_expiry();
-
-    eprintln!(
-        "[announce] share code: {}  (expires in {}m {}s)",
-        code.display,
-        expires_in / 60,
-        expires_in % 60
-    );
     eprintln!("[announce] relay-only mode — connecting to relay...");
-
-    let tcp = connect_via_relay(&code.display).await?;
+    let tcp = connect_via_relay(code).await?;
     let (mut rh, mut wh) = tcp.into_split();
-
     eprintln!("[announce] Noise XX handshake (responder, relay)...");
     let hs = perform_handshake(&mut wh, &mut rh, &private_key, HandshakeRole::Responder).await?;
     let fingerprint = to_fingerprint(&hs.remote_pubkey);
     eprintln!("[announce] relay: connected to {}", fingerprint);
-
-    let session = RelaySession::from_split(rh, wh, hs.remote_pubkey, fingerprint, hs.transport);
-    Ok((code.display, Session::Relay(session)))
+    Ok(Session::Relay(RelaySession::from_split(rh, wh, hs.remote_pubkey, fingerprint, hs.transport)))
 }
 
 /// Receiver: connect to relay with the given code, wait to be paired, handshake.

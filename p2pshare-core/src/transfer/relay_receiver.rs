@@ -1,11 +1,10 @@
-use sha2::{Digest, Sha256};
 use std::{collections::HashSet, path::{Path, PathBuf}};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use crate::{
     session::relay_session::{RelayMsg, RelaySession},
     transfer::{
-        manifest::{ControlMessage, TransferMode},
+        manifest::{actual_chunk_size, ControlMessage, TransferMode},
         resume::{find_resumable, TransferState},
     },
     Error, Result,
@@ -81,13 +80,21 @@ pub async fn receive_file_relay(session: &RelaySession, output_dir: &Path) -> Re
     while !pending.is_empty() {
         match session.recv_msg().await? {
             RelayMsg::Chunk { index: chunk_index, ciphertext } => {
-                let plaintext = session.decrypt_chunk(chunk_index, &ciphertext)?;
+                // Noise AEAD decryption: success = authenticated. Failure = corrupted.
+                let plaintext = match session.decrypt_chunk(chunk_index, &ciphertext) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[recv/relay] chunk {chunk_index} decrypt failed ({e}) — NACKing");
+                        session
+                            .send_ctrl(&ControlMessage::ChunkNack { index: chunk_index })
+                            .await?;
+                        continue;
+                    }
+                };
 
-                let actual: [u8; 32] = Sha256::digest(&plaintext).into();
-                let expected = manifest.chunks[chunk_index as usize].hash;
-
-                if actual != expected {
-                    eprintln!("[recv/relay] chunk {chunk_index} hash mismatch — NACKing");
+                let expected_size = actual_chunk_size(chunk_index, manifest.chunk_size, manifest.total_size) as usize;
+                if plaintext.len() != expected_size {
+                    eprintln!("[recv/relay] chunk {chunk_index} size mismatch — NACKing");
                     session
                         .send_ctrl(&ControlMessage::ChunkNack { index: chunk_index })
                         .await?;

@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::Result;
 
@@ -23,6 +21,11 @@ pub struct StreamingConfig {
 
 // ── Manifest ───────────────────────────────────────────────────────────────────
 
+/// Sent at the start of every transfer. Chunk integrity is guaranteed by
+/// the Noise AEAD on each chunk (read_message authenticates every byte), so
+/// we don't need per-chunk SHA-256 hashes here. This keeps the manifest O(1)
+/// in size and allows arbitrarily large files without hitting Snow's 65 KB
+/// per-message limit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileManifest {
     pub session_id: [u8; 20],
@@ -31,17 +34,8 @@ pub struct FileManifest {
     pub total_size: u64,
     pub chunk_size: u32,
     pub chunk_count: u32,
-    pub chunks: Vec<ChunkMeta>,
     pub transfer_mode: TransferMode,
     pub created_at: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkMeta {
-    pub index: u32,
-    pub size: u32,
-    /// SHA-256 of the plaintext chunk — verified post-decryption.
-    pub hash: [u8; 32],
 }
 
 // ── Control messages ───────────────────────────────────────────────────────────
@@ -74,7 +68,15 @@ pub fn parallel_streams_for(file_size: u64) -> usize {
     }
 }
 
-/// Build a `FileManifest` by reading the file and computing per-chunk SHA-256 hashes.
+/// Returns the actual byte count for chunk `index`, accounting for the last
+/// chunk being potentially smaller than `chunk_size`.
+pub fn actual_chunk_size(chunk_index: u32, chunk_size: u32, total_size: u64) -> u32 {
+    let start = chunk_index as u64 * chunk_size as u64;
+    (total_size - start).min(chunk_size as u64) as u32
+}
+
+/// Build a `FileManifest` from file metadata only — no file content is read.
+/// Chunk integrity is handled by Noise AEAD during transfer.
 pub async fn build_manifest(file_path: &Path) -> Result<FileManifest> {
     use rand::Rng;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -91,22 +93,6 @@ pub async fn build_manifest(file_path: &Path) -> Result<FileManifest> {
         .into_owned();
     let mime_type = guess_mime(&filename);
 
-    let mut file = tokio::fs::File::open(file_path).await?;
-    let mut chunks = Vec::with_capacity(chunk_count as usize);
-    let mut buf = vec![0u8; chunk_size as usize];
-
-    for index in 0..chunk_count {
-        let chunk_start = index as u64 * chunk_size as u64;
-        let expected = ((total_size - chunk_start).min(chunk_size as u64)) as usize;
-
-        // Seek to position (for safety — read may be sequential but explicit is safer)
-        file.seek(std::io::SeekFrom::Start(chunk_start)).await?;
-        file.read_exact(&mut buf[..expected]).await?;
-
-        let hash: [u8; 32] = Sha256::digest(&buf[..expected]).into();
-        chunks.push(ChunkMeta { index, size: expected as u32, hash });
-    }
-
     let session_id: [u8; 20] = rand::thread_rng().gen();
 
     Ok(FileManifest {
@@ -116,7 +102,6 @@ pub async fn build_manifest(file_path: &Path) -> Result<FileManifest> {
         total_size,
         chunk_size,
         chunk_count,
-        chunks,
         transfer_mode: TransferMode::Bulk,
         created_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)

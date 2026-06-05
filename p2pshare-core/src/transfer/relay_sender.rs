@@ -3,7 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::{
     session::relay_session::RelaySession,
-    transfer::manifest::{build_manifest, ChunkMeta, ControlMessage, TransferMode},
+    transfer::manifest::{actual_chunk_size, build_manifest, ControlMessage, TransferMode},
     Error, Result,
 };
 
@@ -61,14 +61,11 @@ pub async fn send_file_relay(session: &RelaySession, file_path: &Path) -> Result
     );
 
     for &idx in &to_send {
-        send_one_chunk(session, file_path, &manifest.chunks[idx as usize], manifest.chunk_size)
+        send_one_chunk(session, file_path, idx, manifest.chunk_size, manifest.total_size)
             .await?;
     }
 
     // ── NACK/Complete loop ─────────────────────────────────────────────────────
-    // TCP is full-duplex: receiver sends NACKs as bad chunks arrive (even while
-    // the sender was still sending). After all chunks are sent we read until
-    // Complete, retransmitting any NACKed chunks immediately.
     loop {
         match session.recv_ctrl_msg().await? {
             ControlMessage::Complete => {
@@ -77,13 +74,8 @@ pub async fn send_file_relay(session: &RelaySession, file_path: &Path) -> Result
             }
             ControlMessage::ChunkNack { index } => {
                 eprintln!("[send/relay] NACK chunk {index} — retransmitting");
-                send_one_chunk(
-                    session,
-                    file_path,
-                    &manifest.chunks[index as usize],
-                    manifest.chunk_size,
-                )
-                .await?;
+                send_one_chunk(session, file_path, index, manifest.chunk_size, manifest.total_size)
+                    .await?;
             }
             ControlMessage::Error { message, .. } => {
                 return Err(Error::ConnectionFailed(format!("receiver: {message}")));
@@ -96,19 +88,21 @@ pub async fn send_file_relay(session: &RelaySession, file_path: &Path) -> Result
 async fn send_one_chunk(
     session: &RelaySession,
     file_path: &Path,
-    chunk: &ChunkMeta,
+    chunk_index: u32,
     chunk_size: u32,
+    total_size: u64,
 ) -> Result<()> {
-    let plaintext = read_chunk(file_path, chunk, chunk_size).await?;
-    let encrypted = session.encrypt_chunk(chunk.index, &plaintext)?;
-    session.send_chunk_raw(chunk.index, &encrypted).await
+    let plaintext = read_chunk(file_path, chunk_index, chunk_size, total_size).await?;
+    let encrypted = session.encrypt_chunk(chunk_index, &plaintext)?;
+    session.send_chunk_raw(chunk_index, &encrypted).await
 }
 
-async fn read_chunk(path: &Path, chunk: &ChunkMeta, chunk_size: u32) -> Result<Vec<u8>> {
+async fn read_chunk(path: &Path, chunk_index: u32, chunk_size: u32, total_size: u64) -> Result<Vec<u8>> {
     let mut file = tokio::fs::File::open(path).await?;
-    let offset = chunk.index as u64 * chunk_size as u64;
+    let offset = chunk_index as u64 * chunk_size as u64;
     file.seek(std::io::SeekFrom::Start(offset)).await?;
-    let mut buf = vec![0u8; chunk.size as usize];
+    let size = actual_chunk_size(chunk_index, chunk_size, total_size) as usize;
+    let mut buf = vec![0u8; size];
     file.read_exact(&mut buf).await?;
     Ok(buf)
 }

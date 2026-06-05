@@ -1,4 +1,6 @@
 pub mod dht;
+pub mod lan_broadcast;
+pub mod lan_multicast;
 pub mod mdns;
 pub mod presence;
 pub mod share_code;

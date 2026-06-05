@@ -91,6 +91,16 @@ pub async fn browse_for_code(code: &str) -> Result<SocketAddr> {
             .await
             .map_err(|_| Error::ConnectionFailed("mDNS browse channel closed".into()))?;
 
+        match &event {
+            ServiceEvent::ServiceResolved(_) => {}
+            ServiceEvent::ServiceFound(ty, name) => {
+                eprintln!("[mDNS] found (unresolved): {} / {}", ty, name);
+            }
+            other => {
+                eprintln!("[mDNS] event: {:?}", other);
+            }
+        }
+
         if let ServiceEvent::ServiceResolved(info) = event {
             let found_code = info
                 .txt_properties
@@ -99,6 +109,7 @@ pub async fn browse_for_code(code: &str) -> Result<SocketAddr> {
                 .to_uppercase();
 
             if found_code != code_upper {
+                eprintln!("[mDNS] resolved different code: {}, want: {}", found_code, code_upper);
                 continue;
             }
 

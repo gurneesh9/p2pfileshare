@@ -23,9 +23,9 @@ use crate::{
     identity::storage::{load, reset, save},
     session::{
         coordinator::{
-            announce_and_connect, announce_and_connect_with_code, announce_via_relay_only,
-            announce_via_relay_only_with_code, connect_to_contact, connect_via_relay_only,
-            lookup_and_connect,
+            announce_and_connect, announce_and_connect_with_code, announce_mdns_only_with_code,
+            announce_via_relay_only, announce_via_relay_only_with_code, connect_to_contact,
+            connect_via_relay_only, lookup_and_connect, lookup_mdns_only,
         },
         Session,
     },
@@ -232,6 +232,30 @@ pub async fn api_begin_send(code: String) -> Result<u64, String> {
         .ok_or("no identity")?;
     let dht = DhtLayer::new().map_err(|e| e.to_string())?;
     let session = announce_and_connect_with_code(&identity, &dht, &code)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(store_session(session))
+}
+
+/// Phase 2 of send — LAN-only (mDNS, no DHT/relay).
+/// Blocks until a receiver connects directly on the same network.
+pub async fn api_begin_send_lan_only(code: String) -> Result<u64, String> {
+    let identity = load()
+        .map_err(|e| e.to_string())?
+        .ok_or("no identity")?;
+    let session = announce_mdns_only_with_code(&identity, &code)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(store_session(session))
+}
+
+/// Receiver: connect via LAN-only (mDNS, no DHT/relay).
+/// Returns session handle for use with api_drive_receive.
+pub async fn api_connect_lan_only(code: String) -> Result<u64, String> {
+    let identity = load()
+        .map_err(|e| e.to_string())?
+        .ok_or("no identity")?;
+    let session = lookup_mdns_only(&identity, &code)
         .await
         .map_err(|e| e.to_string())?;
     Ok(store_session(session))

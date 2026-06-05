@@ -9,7 +9,7 @@ use tokio::task::JoinSet;
 use crate::{session::{coordinator::PeerSession, Session}, Error, Result};
 
 use super::{
-    manifest::{build_manifest, parallel_streams_for, ChunkMeta, ControlMessage, FileManifest, TransferMode},
+    manifest::{actual_chunk_size, build_manifest, parallel_streams_for, ControlMessage, FileManifest, TransferMode},
     relay_sender::send_file_relay,
 };
 
@@ -127,8 +127,7 @@ async fn dispatch_chunks(
         let permit = semaphore.clone().acquire_owned().await.unwrap();
 
         // Read plaintext from disk (main loop, sequential per chunk)
-        let chunk_meta = &manifest.chunks[chunk_index as usize];
-        let plaintext = read_chunk(file_path, chunk_meta, manifest.chunk_size).await?;
+        let plaintext = read_chunk(file_path, chunk_index, manifest.chunk_size, manifest.total_size).await?;
 
         // Encrypt (sequential, explicit nonce — no ordering constraint on decrypt side)
         let encrypted = session.encrypt_chunk(chunk_index, &plaintext)?;
@@ -163,11 +162,12 @@ async fn dispatch_chunks(
     Ok(())
 }
 
-async fn read_chunk(path: &Path, chunk: &ChunkMeta, chunk_size: u32) -> Result<Vec<u8>> {
+async fn read_chunk(path: &Path, chunk_index: u32, chunk_size: u32, total_size: u64) -> Result<Vec<u8>> {
     let mut file = tokio::fs::File::open(path).await?;
-    let offset = chunk.index as u64 * chunk_size as u64;
+    let offset = chunk_index as u64 * chunk_size as u64;
     file.seek(std::io::SeekFrom::Start(offset)).await?;
-    let mut buf = vec![0u8; chunk.size as usize];
+    let size = actual_chunk_size(chunk_index, chunk_size, total_size) as usize;
+    let mut buf = vec![0u8; size];
     file.read_exact(&mut buf).await?;
     Ok(buf)
 }

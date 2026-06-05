@@ -14,6 +14,8 @@ use crate::{
     crypto::handshake::{perform_handshake, HandshakeRole},
     discovery::{
         dht::DhtLayer,
+        lan_broadcast,
+        lan_multicast,
         mdns,
         share_code::{generate_share_code, secs_until_expiry, to_infohash, to_recv_infohash},
     },
@@ -201,6 +203,10 @@ pub async fn announce_and_connect_with_code(
             None
         }
     };
+    // Multicast UDP (socket2, custom group 239.255.52.52:52525) — works on iOS where mdns-sd doesn't.
+    let _multicaster = lan_multicast::start_multicast(code, lan_port).await.ok();
+    // Broadcast UDP fallback for networks that filter multicast.
+    let _broadcaster = lan_broadcast::start_broadcast(code, lan_port).await.ok();
 
     // ── Internet: STUN + DHT announce ──────────────────────────────────────────
     let internet_server_cfg = prebuilt_server_config()?;
@@ -211,13 +217,16 @@ pub async fn announce_and_connect_with_code(
     let infohash_send = to_infohash(code);
     let infohash_recv = to_recv_infohash(code);
 
+    let own_ext_ip;
     let announce_port = match external_addr(&punch_socket).await {
         Some(ext) => {
             eprintln!("[announce] STUN: external address is {}", ext);
+            own_ext_ip = Some(ext.ip());
             ext.port()
         }
         None => {
             eprintln!("[announce] STUN failed, falling back to local port {}", local_port);
+            own_ext_ip = None;
             local_port
         }
     };
@@ -262,8 +271,22 @@ pub async fn announce_and_connect_with_code(
         result = async {
             let receiver_addr = poll_for_receiver(dht, infohash_recv, 60).await?;
             eprintln!("[announce] receiver found at {}", receiver_addr);
-            eprintln!("[announce] hole punching...");
 
+            // Same-NAT: receiver shares our external IP → hairpin NAT → hole punch guaranteed to fail.
+            // Give the LAN (mDNS) branch a head start, then go straight to relay.
+            if own_ext_ip.map(|ip| ip == receiver_addr.ip()).unwrap_or(false) {
+                eprintln!("[announce] same network detected — skipping hole punch, waiting for LAN path...");
+                sleep(Duration::from_secs(7)).await;
+                eprintln!("[announce] LAN path didn't win — connecting via relay (same-NAT)...");
+                let tcp = connect_via_relay(&code_display).await?;
+                let (mut rh, mut wh) = tcp.into_split();
+                let hs = perform_handshake(&mut wh, &mut rh, &private_key, HandshakeRole::Responder).await?;
+                let fingerprint = to_fingerprint(&hs.remote_pubkey);
+                eprintln!("[announce] relay: connected to {}", fingerprint);
+                return Ok(Session::Relay(RelaySession::from_split(rh, wh, hs.remote_pubkey, fingerprint, hs.transport)));
+            }
+
+            eprintln!("[announce] hole punching...");
             match hole_punch(punch_socket.clone(), receiver_addr).await {
                 Ok(()) => {
                     eprintln!("[announce] QUIC server starting (internet)...");
@@ -330,16 +353,18 @@ pub async fn lookup_and_connect(
     eprintln!("[connect] looking up {} (LAN + internet simultaneously)...", code_upper);
 
     let session = tokio::select! {
-        // LAN path — browse mDNS for up to 6 s, then connect directly.
+        // LAN path — race multicast and broadcast listeners; first one to see the sender wins.
+        // Multicast works on iOS (socket2 + IP_ADD_MEMBERSHIP); broadcast is the fallback.
         // On any error the branch is disabled and internet path continues.
         Ok(session) = async {
-            let sender_addr = timeout(
-                Duration::from_secs(6),
-                mdns::browse_for_code(&code_upper),
-            )
+            let sender_addr = timeout(Duration::from_secs(8), async {
+                tokio::select! {
+                    Ok(addr) = lan_multicast::listen_for_multicast(&code_upper) => addr,
+                    Ok(addr) = lan_broadcast::listen_for_broadcast(&code_upper) => addr,
+                }
+            })
             .await
-            .map_err(|_| Error::PeerNotFound)?   // timeout → PeerNotFound, disables this branch
-            ?;                                     // browse error also disables this branch
+            .map_err(|_| Error::PeerNotFound)?;   // timeout → PeerNotFound, disables this branch
 
             eprintln!("[connect] LAN: found sender at {}", sender_addr);
 
@@ -377,7 +402,8 @@ pub async fn lookup_and_connect(
             let local_port = socket.local_addr()?.port();
             let socket = Arc::new(socket);
 
-            let announce_port = match external_addr(&socket).await {
+            let own_ext = external_addr(&socket).await;
+            let announce_port = match own_ext {
                 Some(ext) => {
                     eprintln!("[connect] STUN: external address is {}", ext);
                     ext.port()
@@ -387,6 +413,22 @@ pub async fn lookup_and_connect(
                     local_port
                 }
             };
+
+            // Same-NAT: sender's external IP == ours → same router → hairpin NAT blocks hole punch.
+            // Back-announce so sender can find us, then wait for the LAN path before falling to relay.
+            if own_ext.map(|e| e.ip() == sender_addr.ip()).unwrap_or(false) {
+                eprintln!("[connect] same network detected — skipping hole punch, preferring LAN...");
+                dht.announce(infohash_recv, announce_port).await;
+                sleep(Duration::from_secs(8)).await;
+                eprintln!("[connect] LAN path timed out — connecting via relay (same-NAT)...");
+                drop(socket);
+                let tcp = connect_via_relay(&code_upper).await?;
+                let (mut rh, mut wh) = tcp.into_split();
+                let hs = perform_handshake(&mut wh, &mut rh, &private_key, HandshakeRole::Initiator).await?;
+                let fingerprint = to_fingerprint(&hs.remote_pubkey);
+                eprintln!("[connect] relay: connected to {}", fingerprint);
+                return Ok(Session::Relay(RelaySession::from_split(rh, wh, hs.remote_pubkey, fingerprint, hs.transport)));
+            }
 
             eprintln!("[connect] back-announcing on DHT, port {}...", announce_port);
             dht.announce(infohash_recv, announce_port).await;
@@ -438,6 +480,92 @@ pub async fn lookup_and_connect(
     };
 
     Ok(session)
+}
+
+// ── LAN-only paths (mDNS only, no DHT, no relay) ─────────────────────────────
+
+/// Sender: bind a QUIC server, advertise via mDNS, wait for a direct LAN connection.
+/// No DHT or relay — fails fast if no peer connects on the local network.
+pub async fn announce_mdns_only_with_code(
+    identity: &UserIdentity,
+    code: &str,
+) -> Result<Session> {
+    let private_key = identity.private_key_bytes();
+
+    let server_cfg = prebuilt_server_config()?;
+    let std_socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let port = std_socket.local_addr()?.port();
+    let ep = make_server_endpoint_with_config(std_socket, server_cfg)?;
+
+    // Advertise via mDNS (CLI), multicast (iOS/Android via socket2), and broadcast (fallback).
+    let _mdns = mdns::advertise(code, port).ok();
+    let _multicaster = lan_multicast::start_multicast(code, port).await.ok();
+    let _broadcaster = lan_broadcast::start_broadcast(code, port).await.ok();
+
+    eprintln!("[announce] LAN-only: advertising {} on port {}", code, port);
+
+    loop {
+        let Some(incoming) = ep.accept().await else {
+            return Err(Error::ConnectionFailed("LAN endpoint closed".into()));
+        };
+        let conn = match incoming.accept().map_err(|e| Error::Quic(e.to_string())) {
+            Ok(c) => match c.await.map_err(|e| Error::Quic(e.to_string())) {
+                Ok(c) => c,
+                Err(e) => { eprintln!("[announce] LAN connection error: {e}"); continue; }
+            },
+            Err(e) => { eprintln!("[announce] LAN incoming error: {e}"); continue; }
+        };
+        let (mut send, mut recv) = match conn.accept_bi().await.map_err(|e| Error::Quic(e.to_string())) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("[announce] LAN stream error: {e}"); continue; }
+        };
+        match perform_handshake(&mut send, &mut recv, &private_key, HandshakeRole::Responder).await {
+            Ok(hs) => {
+                eprintln!("[announce] LAN: connected to {}", to_fingerprint(&hs.remote_pubkey));
+                return Ok(Session::Direct(make_peer_session(conn, hs.remote_pubkey, hs.transport)));
+            }
+            Err(e) => { eprintln!("[announce] LAN handshake error: {e}, retrying"); continue; }
+        }
+    }
+}
+
+/// Receiver: browse mDNS for the sender, connect directly via QUIC.
+/// No DHT or relay — fails fast if sender not found on local network within 15 s.
+pub async fn lookup_mdns_only(identity: &UserIdentity, code: &str) -> Result<Session> {
+    let code_upper = code.to_uppercase();
+    let private_key = identity.private_key_bytes();
+
+    eprintln!("[connect] LAN-only: listening for {} via multicast + broadcast...", code_upper);
+
+    let sender_addr = timeout(Duration::from_secs(8), async {
+        tokio::select! {
+            Ok(addr) = lan_multicast::listen_for_multicast(&code_upper) => addr,
+            Ok(addr) = lan_broadcast::listen_for_broadcast(&code_upper) => addr,
+        }
+    })
+    .await
+    .map_err(|_| Error::ConnectionFailed(
+        "Sender not found on local network. Check that both devices are on the same WiFi and your router does not have AP/Client Isolation enabled.".into()
+    ))?;
+
+    eprintln!("[connect] LAN: found sender at {}", sender_addr);
+
+    let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let ep = make_client_endpoint(std_sock)?;
+    let cfg = skip_verify_client_config()?;
+
+    let conn = ep
+        .connect_with(cfg, sender_addr, "p2pshare")
+        .map_err(|e| Error::Quic(e.to_string()))?
+        .await
+        .map_err(|e| Error::Quic(e.to_string()))?;
+
+    eprintln!("[connect] LAN: Noise XX handshake (initiator)...");
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| Error::Quic(e.to_string()))?;
+    let hs = perform_handshake(&mut send, &mut recv, &private_key, HandshakeRole::Initiator).await?;
+    eprintln!("[connect] LAN: connected to {}", to_fingerprint(&hs.remote_pubkey));
+
+    Ok(Session::Direct(make_peer_session(conn, hs.remote_pubkey, hs.transport)))
 }
 
 // ── Relay-only paths (no DHT, no hole punch) ──────────────────────────────────

@@ -1,11 +1,10 @@
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use crate::{session::{coordinator::PeerSession, Session}, Error, Result};
 
-use super::manifest::{ControlMessage, TransferMode};
+use super::manifest::{actual_chunk_size, ControlMessage, TransferMode};
 use super::relay_receiver::receive_file_relay;
 use super::resume::{find_resumable, TransferState};
 
@@ -110,21 +109,30 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
         recv_stream.read_exact(&mut idx_buf).await?;
         let chunk_index = u32::from_be_bytes(idx_buf);
 
-        // Read encrypted payload (2MB cap — 1MB chunk + 16 bytes + headroom)
+        // Read encrypted payload. Cap at chunk_size + Noise overhead (≤1MB+~400B).
+        let max_enc = manifest.chunk_size as usize + 4096;
         let ciphertext = recv_stream
-            .read_to_end(2 * 1024 * 1024)
+            .read_to_end(max_enc)
             .await
             .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
-        // Decrypt using PeerSession helper (nonce = CHUNK_NONCE_BASE + chunk_index)
-        let plaintext = session.decrypt_chunk(chunk_index, &ciphertext)?;
+        // Noise AEAD decryption: if this succeeds the data is authenticated.
+        // A decrypt failure means the chunk was corrupted in transit — send NACK.
+        let plaintext = match session.decrypt_chunk(chunk_index, &ciphertext) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[recv] chunk {} decrypt failed ({}) — NACKing", chunk_index, e);
+                session
+                    .send_ctrl(&mut ctrl_send, &ControlMessage::ChunkNack { index: chunk_index })
+                    .await?;
+                continue;
+            }
+        };
 
-        // Verify SHA-256 against manifest
-        let actual: [u8; 32] = Sha256::digest(&plaintext).into();
-        let expected = manifest.chunks[chunk_index as usize].hash;
-
-        if actual != expected {
-            eprintln!("[recv] chunk {} hash mismatch — NACKing", chunk_index);
+        // Sanity-check decoded size matches the expected chunk size.
+        let expected_size = actual_chunk_size(chunk_index, manifest.chunk_size, manifest.total_size) as usize;
+        if plaintext.len() != expected_size {
+            eprintln!("[recv] chunk {} size mismatch: got {} expected {} — NACKing", chunk_index, plaintext.len(), expected_size);
             session
                 .send_ctrl(&mut ctrl_send, &ControlMessage::ChunkNack { index: chunk_index })
                 .await?;

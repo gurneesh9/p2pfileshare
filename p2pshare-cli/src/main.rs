@@ -171,7 +171,7 @@ async fn run(cli: Cli) -> xend_core::Result<()> {
 
             println!("Your fingerprint: {}", identity.fingerprint);
 
-            let (_code, session) = if relay {
+            let (code, session) = if relay {
                 announce_via_relay_only(&identity).await?
             } else {
                 let dht = DhtLayer::new()?;
@@ -179,6 +179,7 @@ async fn run(cli: Cli) -> xend_core::Result<()> {
             };
 
             println!();
+            println!("Share code  : {}", code);
             println!("Connected to: {}", session.remote_fingerprint());
             println!("Sending {}...", file.display());
 

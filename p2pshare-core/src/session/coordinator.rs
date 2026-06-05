@@ -584,6 +584,8 @@ pub async fn announce_via_relay_only_with_code(
     code: &str,
 ) -> Result<Session> {
     let private_key = identity.private_key_bytes();
+    // Print the code BEFORE blocking on the relay so the user can share it.
+    println!("Share code: {}", code);
     eprintln!("[announce] relay-only mode — connecting to relay...");
     let tcp = connect_via_relay(code).await?;
     let (mut rh, mut wh) = tcp.into_split();

@@ -24,8 +24,9 @@ use crate::{
     session::{
         coordinator::{
             announce_and_connect, announce_and_connect_with_code, announce_mdns_only_with_code,
-            announce_via_relay_only, announce_via_relay_only_with_code, connect_to_contact,
-            connect_via_relay_only, lookup_and_connect, lookup_mdns_only,
+            announce_via_relay_only, announce_via_relay_only_with_code,
+            announce_via_relay_only_with_code_via_proxy, connect_to_contact, connect_via_relay_only,
+            connect_via_relay_only_via_proxy, lookup_and_connect, lookup_mdns_only,
         },
         Session,
     },
@@ -75,6 +76,22 @@ pub struct ApiTransferResult {
     pub file_name: String,
     pub file_path: String,
     pub bytes_transferred: u64,
+}
+
+// ── Relay proxy (macOS / iOS content-filter workaround) ──────────────────────
+
+/// Point all relay TCP connects to a local Dart-opened proxy for this transfer.
+/// Call before api_begin_send / api_connect_to_code on Apple platforms so that
+/// any relay fallback inside the DHT flow also routes through the proxy.
+#[frb(sync)]
+pub fn api_set_relay_proxy(addr: String) {
+    crate::nat::relay::set_relay_proxy_override(addr);
+}
+
+/// Clear the relay proxy override after a transfer completes.
+#[frb(sync)]
+pub fn api_clear_relay_proxy() {
+    crate::nat::relay::clear_relay_proxy_override();
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -271,6 +288,47 @@ pub async fn api_begin_send_relay_only(code: String) -> Result<u64, String> {
         .await
         .map_err(|e| e.to_string())?;
     Ok(store_session(session))
+}
+
+/// Sender: relay-only via a local Dart-opened TCP proxy.
+/// Dart opens the real relay TCP connection (Network.framework — works in the
+/// macOS App Sandbox) and forwards bytes through 127.0.0.1:proxy_port.
+/// Rust connects to the loopback address, which is never blocked.
+pub async fn api_begin_send_relay_via_proxy(code: String, proxy_port: u32) -> Result<u64, String> {
+    let identity = load()
+        .map_err(|e| e.to_string())?
+        .ok_or("no identity")?;
+    let session = announce_via_relay_only_with_code_via_proxy(&identity, &code, proxy_port as u16)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(store_session(session))
+}
+
+/// Receiver: relay-only via a local Dart-opened TCP proxy.
+pub async fn api_receive_file_relay_via_proxy(
+    code: String,
+    proxy_port: u32,
+    output_dir: String,
+) -> Result<ApiTransferResult, String> {
+    let identity = load()
+        .map_err(|e| e.to_string())?
+        .ok_or("no identity")?;
+    let session = connect_via_relay_only_via_proxy(&identity, &code, proxy_port as u16)
+        .await
+        .map_err(|e| e.to_string())?;
+    let out_path = PathBuf::from(&output_dir);
+    let saved_to = receive_file(&session, &out_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    let file_name = saved_to
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(ApiTransferResult {
+        file_name,
+        file_path: saved_to.to_string_lossy().into_owned(),
+        bytes_transferred: saved_to.metadata().map(|m| m.len()).unwrap_or(0),
+    })
 }
 
 // ── Send flow ─────────────────────────────────────────────────────────────────

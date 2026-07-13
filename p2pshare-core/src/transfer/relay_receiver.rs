@@ -1,5 +1,7 @@
 use std::{collections::HashSet, path::{Path, PathBuf}};
+use std::sync::Arc;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     session::relay_session::{RelayMsg, RelaySession},
@@ -71,6 +73,14 @@ pub async fn receive_file_relay(session: &RelaySession, output_dir: &Path) -> Re
         }
     };
 
+    // Open persistent write handle — no per-chunk open/close.
+    let file = Arc::new(AsyncMutex::new(
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&output_path)
+            .await?,
+    ));
+
     // ── Receive chunks ─────────────────────────────────────────────────────────
     // The relay TCP stream is full-duplex: we can send NACKs while the sender
     // is still transmitting later chunks. NACKs are picked up by the sender
@@ -102,11 +112,21 @@ pub async fn receive_file_relay(session: &RelaySession, output_dir: &Path) -> Re
                 }
 
                 let offset = chunk_index as u64 * manifest.chunk_size as u64;
-                write_at(&output_path, offset, &plaintext).await?;
+                {
+                    let mut f = file.lock().await;
+                    f.seek(std::io::SeekFrom::Start(offset)).await?;
+                    f.write_all(&plaintext).await?;
+                }
 
                 pending.remove(&chunk_index);
                 state.chunks_done.insert(chunk_index);
-                state.save()?;
+                // Throttled async save — same as direct receiver.
+                if state.chunks_done.len() % 16 == 0 {
+                    let s = state.clone();
+                    tokio::task::spawn_blocking(move || s.save())
+                        .await
+                        .map_err(|e| Error::ConnectionFailed(e.to_string()))??;
+                }
 
                 let done = manifest.chunk_count as usize - pending.len();
                 eprintln!(
@@ -124,17 +144,15 @@ pub async fn receive_file_relay(session: &RelaySession, output_dir: &Path) -> Re
         }
     }
 
-    // ── Signal complete ────────────────────────────────────────────────────────
+    // ── Final save + signal complete ───────────────────────────────────────────
+    let s = state.clone();
+    tokio::task::spawn_blocking(move || s.save())
+        .await
+        .map_err(|e| Error::ConnectionFailed(e.to_string()))??;
+
     session.send_ctrl(&ControlMessage::Complete).await?;
     eprintln!("[recv/relay] complete ✓ → {}", output_path.display());
 
     state.delete()?;
     Ok(output_path)
-}
-
-async fn write_at(path: &Path, offset: u64, data: &[u8]) -> Result<()> {
-    let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
-    file.seek(std::io::SeekFrom::Start(offset)).await?;
-    file.write_all(data).await?;
-    Ok(())
 }

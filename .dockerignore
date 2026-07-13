@@ -1,0 +1,6 @@
+target/
+p2pshare-UI/
+tests/
+*.md
+.git/
+.DS_Store

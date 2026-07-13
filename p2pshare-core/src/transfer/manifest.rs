@@ -54,17 +54,17 @@ pub enum ControlMessage {
 
 pub fn chunk_size_for(file_size: u64) -> u32 {
     match file_size {
-        0..=10_000_000 => 65_536,
-        10_000_001..=500_000_000 => 262_144,
-        _ => 1_048_576,
+        0..=10_000_000 => 65_536,           // 64 KB for small files
+        10_000_001..=500_000_000 => 1_048_576,  // 1 MB (was 256 KB)
+        _ => 4_194_304,                     // 4 MB (was 1 MB)
     }
 }
 
 pub fn parallel_streams_for(file_size: u64) -> usize {
     match file_size {
-        0..=10_000_000 => 2,
-        10_000_001..=500_000_000 => 4,
-        _ => 8,
+        0..=10_000_000 => 4,
+        10_000_001..=500_000_000 => 8,  // was 4
+        _ => 16,                         // was 8
     }
 }
 

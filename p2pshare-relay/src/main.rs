@@ -6,7 +6,10 @@ use tokio::{
     time::{timeout, Duration},
 };
 
-const BIND_ADDR: &str = "0.0.0.0:443";
+fn bind_addr() -> String {
+    let port = std::env::var("PORT").unwrap_or_else(|_| "443".into());
+    format!("0.0.0.0:{port}")
+}
 const PAIR_TIMEOUT_SECS: u64 = 60;
 
 // Maps a 16-byte token to the oneshot sender that will receive the second peer's stream.
@@ -18,8 +21,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let listener = TcpListener::bind(BIND_ADDR).await?;
-    tracing::info!("p2pshare relay listening on {}", BIND_ADDR);
+    let addr = bind_addr();
+    let listener = TcpListener::bind(&addr).await?;
+    tracing::info!("p2pshare relay listening on {}", addr);
 
     let waiting: WaitMap = Arc::new(Mutex::new(HashMap::new()));
 

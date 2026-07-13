@@ -34,7 +34,9 @@ pub fn prebuilt_server_config() -> Result<ServerConfig> {
     let quic_srv = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_srv)
         .map_err(|e| Error::Quic(e.to_string()))?;
 
-    Ok(ServerConfig::with_crypto(Arc::new(quic_srv)))
+    let mut cfg = ServerConfig::with_crypto(Arc::new(quic_srv));
+    cfg.transport_config(Arc::new(p2p_transport_config()));
+    Ok(cfg)
 }
 
 /// Build a QUIC server endpoint from a pre-built ServerConfig and a punched socket.
@@ -76,7 +78,24 @@ pub fn skip_verify_client_config() -> Result<ClientConfig> {
     let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
         .map_err(|e| Error::Quic(e.to_string()))?;
 
-    Ok(ClientConfig::new(Arc::new(quic_cfg)))
+    let mut cfg = ClientConfig::new(Arc::new(quic_cfg));
+    cfg.transport_config(Arc::new(p2p_transport_config()));
+    Ok(cfg)
+}
+
+// ── Transport config ───────────────────────────────────────────────────────────
+
+fn p2p_transport_config() -> quinn::TransportConfig {
+    let mut t = quinn::TransportConfig::default();
+    // 64 MB connection-level receive window — supports 16 × 4 MB chunks in flight.
+    t.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
+    // 8 MB per-stream window — enough for one full 4 MB chunk plus headroom.
+    t.stream_receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
+    // 64 MB send window.
+    t.send_window(64 * 1024 * 1024);
+    // Allow enough concurrent uni streams for parallel chunk sending (16 + headroom).
+    t.max_concurrent_uni_streams(quinn::VarInt::from_u32(64));
+    t
 }
 
 // ── SkipCertVerification ───────────────────────────────────────────────────────

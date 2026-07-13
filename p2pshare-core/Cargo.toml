@@ -6,7 +6,7 @@ edition = "2021"
 [lib]
 # cdylib  → produces libxend_core.dylib / .so / .dll (FRB native FFI)
 # lib     → keeps the normal .rlib for xend-cli and tests
-crate-type = ["cdylib", "lib"]
+crate-type = ["cdylib", "staticlib", "lib"]
 
 [dependencies]
 # Async runtime

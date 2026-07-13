@@ -26,7 +26,7 @@ use crate::{
             make_client_endpoint, make_server_endpoint_with_config, prebuilt_server_config,
             skip_verify_client_config,
         },
-        relay::connect_via_relay,
+        relay::{connect_via_relay, connect_via_relay_at},
         stun::external_addr,
     },
     session::{relay_session::RelaySession, Session},
@@ -619,6 +619,46 @@ pub async fn connect_via_relay_only(identity: &UserIdentity, code: &str) -> Resu
         fingerprint,
         hs.transport,
     )))
+}
+
+/// Sender: relay-only, connecting through a local TCP proxy opened by Dart.
+/// Dart opens the real relay connection (via Network.framework) and exposes a
+/// local port — Rust connects to 127.0.0.1:proxy_port instead.  Loopback TCP
+/// is never subject to macOS Network Extension content filters.
+pub async fn announce_via_relay_only_with_code_via_proxy(
+    identity: &UserIdentity,
+    code: &str,
+    proxy_port: u16,
+) -> Result<Session> {
+    let private_key = identity.private_key_bytes();
+    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    eprintln!("[announce] relay-only (proxy) — connecting to {}...", proxy_addr);
+    let tcp = connect_via_relay_at(&proxy_addr, code).await?;
+    let (mut rh, mut wh) = tcp.into_split();
+    eprintln!("[announce] Noise XX handshake (responder, relay/proxy)...");
+    let hs = perform_handshake(&mut wh, &mut rh, &private_key, HandshakeRole::Responder).await?;
+    let fingerprint = to_fingerprint(&hs.remote_pubkey);
+    eprintln!("[announce] relay/proxy: connected to {}", fingerprint);
+    Ok(Session::Relay(RelaySession::from_split(rh, wh, hs.remote_pubkey, fingerprint, hs.transport)))
+}
+
+/// Receiver: relay-only, connecting through a local TCP proxy opened by Dart.
+pub async fn connect_via_relay_only_via_proxy(
+    identity: &UserIdentity,
+    code: &str,
+    proxy_port: u16,
+) -> Result<Session> {
+    let code_upper = code.to_uppercase();
+    let private_key = identity.private_key_bytes();
+    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    eprintln!("[connect] relay-only (proxy) — connecting to {}...", proxy_addr);
+    let tcp = connect_via_relay_at(&proxy_addr, &code_upper).await?;
+    let (mut rh, mut wh) = tcp.into_split();
+    eprintln!("[connect] Noise XX handshake (initiator, relay/proxy)...");
+    let hs = perform_handshake(&mut wh, &mut rh, &private_key, HandshakeRole::Initiator).await?;
+    let fingerprint = to_fingerprint(&hs.remote_pubkey);
+    eprintln!("[connect] relay/proxy: connected to {}", fingerprint);
+    Ok(Session::Relay(RelaySession::from_split(rh, wh, hs.remote_pubkey, fingerprint, hs.transport)))
 }
 
 // ── DHT polling ───────────────────────────────────────────────────────────────

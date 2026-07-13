@@ -1,12 +1,18 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{session::{coordinator::PeerSession, Session}, Error, Result};
 
 use super::manifest::{actual_chunk_size, ControlMessage, TransferMode};
 use super::relay_receiver::receive_file_relay;
 use super::resume::{find_resumable, TransferState};
+
+// Save resume state every N chunks instead of every chunk.
+// Worst-case resume loss on crash = N × chunk_size (N × 1 MB for large files).
+const STATE_SAVE_INTERVAL: u32 = 16;
 
 /// Accept manifest, negotiate resume, receive all chunks, verify, write to `output_dir`.
 /// Returns the path of the completed file.
@@ -81,7 +87,6 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
         }
         None => {
             tokio::fs::create_dir_all(output_dir).await?;
-            // Pre-allocate so we can seek and write chunks in any order
             {
                 let f = tokio::fs::File::create(&output_path).await?;
                 f.set_len(manifest.total_size).await?;
@@ -93,8 +98,17 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
         }
     };
 
+    // ── Open persistent write handle — no per-chunk open/close ────────────────
+    let file = Arc::new(AsyncMutex::new(
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&output_path)
+            .await?,
+    ));
+
     // ── Receive chunks ─────────────────────────────────────────────────────────
     let mut pending: HashSet<u32> = state.missing_chunks().into_iter().collect();
+    let mut chunks_since_save = 0u32;
 
     while !pending.is_empty() {
         // Accept the next incoming unidirectional stream
@@ -109,15 +123,14 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
         recv_stream.read_exact(&mut idx_buf).await?;
         let chunk_index = u32::from_be_bytes(idx_buf);
 
-        // Read encrypted payload. Cap at chunk_size + Noise overhead (≤1MB+~400B).
+        // Read encrypted payload. Cap at chunk_size + Noise overhead.
         let max_enc = manifest.chunk_size as usize + 4096;
         let ciphertext = recv_stream
             .read_to_end(max_enc)
             .await
             .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
-        // Noise AEAD decryption: if this succeeds the data is authenticated.
-        // A decrypt failure means the chunk was corrupted in transit — send NACK.
+        // Noise AEAD decryption.
         let plaintext = match session.decrypt_chunk(chunk_index, &ciphertext) {
             Ok(p) => p,
             Err(e) => {
@@ -129,29 +142,54 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
             }
         };
 
-        // Sanity-check decoded size matches the expected chunk size.
-        let expected_size = actual_chunk_size(chunk_index, manifest.chunk_size, manifest.total_size) as usize;
+        let expected_size =
+            actual_chunk_size(chunk_index, manifest.chunk_size, manifest.total_size) as usize;
         if plaintext.len() != expected_size {
-            eprintln!("[recv] chunk {} size mismatch: got {} expected {} — NACKing", chunk_index, plaintext.len(), expected_size);
+            eprintln!(
+                "[recv] chunk {} size mismatch: got {} expected {} — NACKing",
+                chunk_index,
+                plaintext.len(),
+                expected_size
+            );
             session
                 .send_ctrl(&mut ctrl_send, &ControlMessage::ChunkNack { index: chunk_index })
                 .await?;
             continue;
         }
 
-        // Write at the correct offset
+        // Write at correct offset using the persistent handle — no open/close.
         let offset = chunk_index as u64 * manifest.chunk_size as u64;
-        write_at(&output_path, offset, &plaintext).await?;
+        {
+            let mut f = file.lock().await;
+            f.seek(std::io::SeekFrom::Start(offset)).await?;
+            f.write_all(&plaintext).await?;
+        }
 
         pending.remove(&chunk_index);
         state.chunks_done.insert(chunk_index);
-        state.save()?;
 
         let done = manifest.chunk_count as usize - pending.len();
         eprintln!("[recv] chunk {} ✓  ({}/{})", chunk_index, done, manifest.chunk_count);
+
+        // Throttled state save — offloaded to blocking thread so it never stalls
+        // the async executor. Saves every STATE_SAVE_INTERVAL chunks instead of
+        // every chunk, cutting synchronous FS flushes by 16×.
+        chunks_since_save += 1;
+        if chunks_since_save >= STATE_SAVE_INTERVAL {
+            let s = state.clone();
+            tokio::task::spawn_blocking(move || s.save())
+                .await
+                .map_err(|e| Error::ConnectionFailed(e.to_string()))??;
+            chunks_since_save = 0;
+        }
     }
 
-    // ── Signal complete ────────────────────────────────────────────────────────
+    // ── Final state save + signal complete ────────────────────────────────────
+    let s = state.clone();
+    tokio::task::spawn_blocking(move || s.save())
+        .await
+        .map_err(|e| Error::ConnectionFailed(e.to_string()))??;
+
     session
         .send_ctrl(&mut ctrl_send, &ControlMessage::Complete)
         .await?;
@@ -232,7 +270,7 @@ mod tests {
             let hs = perform_handshake(&mut s, &mut r, &sender_privkey, HandshakeRole::Responder).await.unwrap();
             let session = Session::Direct(make_session(conn, hs.transport, hs.remote_pubkey));
             send_file(&session, &src_clone).await.unwrap();
-            hs.remote_pubkey  // return receiver's pubkey to verify
+            hs.remote_pubkey
         });
 
         // Receiver (client role for QUIC + Noise initiator)
@@ -242,19 +280,10 @@ mod tests {
         let session = Session::Direct(make_session(conn, hs.transport, hs.remote_pubkey));
         let out_path = receive_file(&session, &out_dir).await.unwrap();
 
-        // Verify the sender task completed
         let remote = send_handle.await.unwrap();
         assert_eq!(remote, receiver_pubkey, "sender sees receiver's pubkey");
 
-        // Verify file contents match
         let received = tokio::fs::read(&out_path).await.unwrap();
         assert_eq!(received, content);
     }
-}
-
-async fn write_at(path: &Path, offset: u64, data: &[u8]) -> Result<()> {
-    let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
-    file.seek(std::io::SeekFrom::Start(offset)).await?;
-    file.write_all(data).await?;
-    Ok(())
 }

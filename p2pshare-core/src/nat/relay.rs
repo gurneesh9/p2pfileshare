@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -9,16 +9,40 @@ use tokio::{
 
 use crate::{Error, Result};
 
-const DEFAULT_RELAY: &str = "34.61.29.61:443";
+const DEFAULT_RELAY: &str = "xend-relay.fly.dev:8443";
 
-pub fn relay_addr() -> &'static str {
-    static ADDR: OnceLock<String> = OnceLock::new();
-    ADDR.get_or_init(|| {
-        match std::env::var("RELAY_ADDR") {
+// Runtime override — set by Dart on Apple platforms before any relay connection.
+// Points all relay TCP connects to a local Dart proxy that bridges to the real
+// relay via Network.framework (bypassing BSD socket content filters).
+static RELAY_PROXY_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_relay_proxy_override(addr: String) {
+    if let Ok(mut g) = RELAY_PROXY_OVERRIDE.lock() {
+        *g = Some(addr);
+    }
+}
+
+pub fn clear_relay_proxy_override() {
+    if let Ok(mut g) = RELAY_PROXY_OVERRIDE.lock() {
+        *g = None;
+    }
+}
+
+pub fn relay_addr() -> String {
+    // Proxy override wins (set per-transfer by Dart on macOS/iOS).
+    if let Ok(g) = RELAY_PROXY_OVERRIDE.lock() {
+        if let Some(ref addr) = *g {
+            return addr.clone();
+        }
+    }
+    // Otherwise fall back to env var or compiled default (cached after first read).
+    static DEFAULT_ADDR: OnceLock<String> = OnceLock::new();
+    DEFAULT_ADDR
+        .get_or_init(|| match std::env::var("RELAY_ADDR") {
             Ok(val) if !val.trim().is_empty() => val,
             _ => DEFAULT_RELAY.to_string(),
-        }
-    })
+        })
+        .clone()
 }
 
 /// Derive a 16-byte pairing token from the share code.
@@ -32,8 +56,14 @@ pub fn relay_token_for(code: &str) -> [u8; 16] {
 /// Connect to the relay and wait to be paired with the other peer.
 /// Returns the TCP stream once pairing is signalled by the relay.
 pub async fn connect_via_relay(code: &str) -> Result<TcpStream> {
-    let token = relay_token_for(code);
     let addr = relay_addr();
+    connect_via_relay_at(&addr, code).await
+}
+
+/// Connect to `addr` as if it were the relay (used when Dart opens the real
+/// relay connection and exposes a local TCP proxy instead).
+pub async fn connect_via_relay_at(addr: &str, code: &str) -> Result<TcpStream> {
+    let token = relay_token_for(code);
 
     eprintln!("[relay] connecting to {}...", addr);
     let mut stream = TcpStream::connect(addr)
@@ -65,10 +95,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_relay_addr() {
-        std::env::set_var("RELAY_ADDR", "127.0.0.1:1234");
-        let addr = relay_addr();
-        assert_eq!(addr, "127.0.0.1:1234");
+    fn test_relay_proxy_override() {
+        set_relay_proxy_override("127.0.0.1:9999".to_string());
+        assert_eq!(relay_addr(), "127.0.0.1:9999");
+        clear_relay_proxy_override();
     }
 }
 

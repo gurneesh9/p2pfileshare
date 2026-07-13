@@ -4,6 +4,7 @@ use std::sync::{
     Arc,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinSet;
 
 use crate::{session::{coordinator::PeerSession, Session}, Error, Result};
@@ -34,6 +35,9 @@ async fn send_file_direct(session: &PeerSession, file_path: &Path) -> Result<()>
         "[send] {} chunks × {} bytes, {} bytes total",
         manifest.chunk_count, manifest.chunk_size, manifest.total_size
     );
+
+    // ── Open file once — no per-chunk open/close ───────────────────────────────
+    let file = Arc::new(AsyncMutex::new(tokio::fs::File::open(file_path).await?));
 
     // ── Open control stream ────────────────────────────────────────────────────
     let (mut ctrl_send, mut ctrl_recv) = session
@@ -80,7 +84,7 @@ async fn send_file_direct(session: &PeerSession, file_path: &Path) -> Result<()>
         manifest.chunk_count
     );
 
-    dispatch_chunks(session, file_path, &manifest, &to_send).await?;
+    dispatch_chunks(session, file.clone(), &manifest, &to_send).await?;
 
     // ── Handle NACKs until receiver sends Complete ─────────────────────────────
     loop {
@@ -91,7 +95,7 @@ async fn send_file_direct(session: &PeerSession, file_path: &Path) -> Result<()>
             }
             ControlMessage::ChunkNack { index } => {
                 eprintln!("[send] NACK chunk {}, retrying", index);
-                dispatch_chunks(session, file_path, &manifest, &[index]).await?;
+                dispatch_chunks(session, file.clone(), &manifest, &[index]).await?;
             }
             ControlMessage::Error { message, .. } => {
                 return Err(Error::ConnectionFailed(format!("receiver: {}", message)));
@@ -105,7 +109,7 @@ async fn send_file_direct(session: &PeerSession, file_path: &Path) -> Result<()>
 
 async fn dispatch_chunks(
     session: &PeerSession,
-    file_path: &Path,
+    file: Arc<AsyncMutex<tokio::fs::File>>,
     manifest: &FileManifest,
     chunk_indices: &[u32],
 ) -> Result<()> {
@@ -126,8 +130,8 @@ async fn dispatch_chunks(
 
         let permit = semaphore.clone().acquire_owned().await.unwrap();
 
-        // Read plaintext from disk (main loop, sequential per chunk)
-        let plaintext = read_chunk(file_path, chunk_index, manifest.chunk_size, manifest.total_size).await?;
+        // Read plaintext from the persistent handle (seek + read, no open/close).
+        let plaintext = read_chunk(&file, chunk_index, manifest.chunk_size, manifest.total_size).await?;
 
         // Encrypt (sequential, explicit nonce — no ordering constraint on decrypt side)
         let encrypted = session.encrypt_chunk(chunk_index, &plaintext)?;
@@ -162,12 +166,17 @@ async fn dispatch_chunks(
     Ok(())
 }
 
-async fn read_chunk(path: &Path, chunk_index: u32, chunk_size: u32, total_size: u64) -> Result<Vec<u8>> {
-    let mut file = tokio::fs::File::open(path).await?;
+async fn read_chunk(
+    file: &AsyncMutex<tokio::fs::File>,
+    chunk_index: u32,
+    chunk_size: u32,
+    total_size: u64,
+) -> Result<Vec<u8>> {
     let offset = chunk_index as u64 * chunk_size as u64;
-    file.seek(std::io::SeekFrom::Start(offset)).await?;
     let size = actual_chunk_size(chunk_index, chunk_size, total_size) as usize;
     let mut buf = vec![0u8; size];
-    file.read_exact(&mut buf).await?;
+    let mut f = file.lock().await;
+    f.seek(std::io::SeekFrom::Start(offset)).await?;
+    f.read_exact(&mut buf).await?;
     Ok(buf)
 }

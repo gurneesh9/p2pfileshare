@@ -87,12 +87,13 @@ pub fn skip_verify_client_config() -> Result<ClientConfig> {
 
 fn p2p_transport_config() -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
-    // 64 MB connection-level receive window.
-    t.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
-    // 16 MB per-stream window — enough for the single data stream to stay full.
-    t.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
-    // 64 MB send window.
-    t.send_window(64 * 1024 * 1024);
+    // 128 MB connection-level receive window.
+    t.receive_window(quinn::VarInt::from_u32(128 * 1024 * 1024));
+    // 64 MB per-stream window — large enough for a full 16 MB chunk + Noise overhead
+    // to be in flight so the sender is never stalled waiting for window credits.
+    t.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
+    // 128 MB send window.
+    t.send_window(128 * 1024 * 1024);
     // We only need a handful of streams (1 ctrl bi + 1 data uni), but keep
     // headroom for relay-session streams that share the same config path.
     t.max_concurrent_uni_streams(quinn::VarInt::from_u32(8));

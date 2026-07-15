@@ -54,9 +54,9 @@ pub enum ControlMessage {
 
 pub fn chunk_size_for(file_size: u64) -> u32 {
     match file_size {
-        0..=10_000_000 => 65_536,           // 64 KB for small files
-        10_000_001..=500_000_000 => 1_048_576,  // 1 MB (was 256 KB)
-        _ => 4_194_304,                     // 4 MB (was 1 MB)
+        0..=5_000_000 => 524_288,            // 512 KB  for files ≤ 5 MB
+        5_000_001..=500_000_000 => 8_388_608, // 8 MB   for files ≤ 500 MB
+        _ => 16_777_216,                      // 16 MB  for large files
     }
 }
 

@@ -127,7 +127,10 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
     // until `pending` is empty rather than until stream EOF.
     let mut pending: HashSet<u32> = state.missing_chunks().into_iter().collect();
     let mut chunks_since_save = 0u32;
-    let max_payload = manifest.chunk_size as usize + 4096; // Noise overhead headroom
+    // Noise wraps each 65519-byte sub-message with 4-byte length + 16-byte tag,
+    // plus 2 bytes for sub_count. ceil(chunk/65519)*20+2 ≤ chunk/3000 for any
+    // chunk size, so chunk/2048 gives comfortable headroom.
+    let max_payload = manifest.chunk_size as usize + manifest.chunk_size as usize / 2048 + 4096;
 
     while !pending.is_empty() {
         // ── Read header ────────────────────────────────────────────────────────

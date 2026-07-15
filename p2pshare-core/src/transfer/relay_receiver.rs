@@ -7,6 +7,7 @@ use crate::{
     session::relay_session::{RelayMsg, RelaySession},
     transfer::{
         manifest::{actual_chunk_size, ControlMessage, TransferMode},
+        progress,
         resume::{find_resumable, TransferState},
     },
     Error, Result,
@@ -85,6 +86,16 @@ pub async fn receive_file_relay(session: &RelaySession, output_dir: &Path) -> Re
     // The relay TCP stream is full-duplex: we can send NACKs while the sender
     // is still transmitting later chunks. NACKs are picked up by the sender
     // in its post-send read loop and trigger immediate retransmission.
+    let initial_done: u64 = state
+        .chunks_done
+        .iter()
+        .map(|&i| actual_chunk_size(i, manifest.chunk_size, manifest.total_size) as u64)
+        .sum();
+    progress::reset(manifest.total_size);
+    if initial_done > 0 {
+        progress::advance(initial_done);
+    }
+
     let mut pending: HashSet<u32> = state.missing_chunks().into_iter().collect();
 
     while !pending.is_empty() {
@@ -118,6 +129,7 @@ pub async fn receive_file_relay(session: &RelaySession, output_dir: &Path) -> Re
                     f.write_all(&plaintext).await?;
                 }
 
+                progress::advance(plaintext.len() as u64);
                 pending.remove(&chunk_index);
                 state.chunks_done.insert(chunk_index);
                 // Throttled async save — same as direct receiver.

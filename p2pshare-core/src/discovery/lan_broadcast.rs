@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 
 use crate::{Error, Result};
+use super::local_wifi_ip;
 
 const BROADCAST_PORT: u16 = 47474;
 const PREFIX: &str = "XEND1:";
@@ -116,11 +117,6 @@ pub async fn listen_for_broadcast(code: &str) -> Result<SocketAddr> {
 
 /// Subnet-directed broadcast address for the local WiFi interface (assumes /24).
 fn subnet_broadcast() -> Option<Ipv4Addr> {
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect("8.8.8.8:80").ok()?;
-    if let IpAddr::V4(v4) = sock.local_addr().ok()?.ip() {
-        let [a, b, c, _] = v4.octets();
-        return Some(Ipv4Addr::new(a, b, c, 255));
-    }
-    None
+    let [a, b, c, _] = local_wifi_ip()?.octets();
+    Some(Ipv4Addr::new(a, b, c, 255))
 }

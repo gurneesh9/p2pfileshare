@@ -87,14 +87,20 @@ pub fn skip_verify_client_config() -> Result<ClientConfig> {
 
 fn p2p_transport_config() -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
-    // 64 MB connection-level receive window — supports 16 × 4 MB chunks in flight.
+    // 64 MB connection-level receive window.
     t.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
-    // 8 MB per-stream window — enough for one full 4 MB chunk plus headroom.
-    t.stream_receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
+    // 16 MB per-stream window — enough for the single data stream to stay full.
+    t.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
     // 64 MB send window.
     t.send_window(64 * 1024 * 1024);
-    // Allow enough concurrent uni streams for parallel chunk sending (16 + headroom).
-    t.max_concurrent_uni_streams(quinn::VarInt::from_u32(64));
+    // We only need a handful of streams (1 ctrl bi + 1 data uni), but keep
+    // headroom for relay-session streams that share the same config path.
+    t.max_concurrent_uni_streams(quinn::VarInt::from_u32(8));
+    // 1400-byte initial MTU — safe on Ethernet/WiFi (Ethernet MTU is 1500).
+    // This skips the conservative 1200-byte internet default and the PMTUD
+    // probe round-trips it would trigger, giving ~17% more payload per packet
+    // from the very first frame.
+    t.initial_mtu(1400);
     t
 }
 

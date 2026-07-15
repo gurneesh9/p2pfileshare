@@ -1,4 +1,5 @@
 pub mod manifest;
+pub mod progress;
 pub mod receiver;
 pub mod relay_receiver;
 pub mod relay_sender;

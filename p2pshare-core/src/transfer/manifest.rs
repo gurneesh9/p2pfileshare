@@ -60,14 +60,6 @@ pub fn chunk_size_for(file_size: u64) -> u32 {
     }
 }
 
-pub fn parallel_streams_for(file_size: u64) -> usize {
-    match file_size {
-        0..=10_000_000 => 4,
-        10_000_001..=500_000_000 => 8,  // was 4
-        _ => 16,                         // was 8
-    }
-}
-
 /// Returns the actual byte count for chunk `index`, accounting for the last
 /// chunk being potentially smaller than `chunk_size`.
 pub fn actual_chunk_size(chunk_index: u32, chunk_size: u32, total_size: u64) -> u32 {

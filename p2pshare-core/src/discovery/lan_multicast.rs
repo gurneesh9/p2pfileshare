@@ -1,9 +1,10 @@
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
 use crate::{Error, Result};
+use super::local_wifi_ip;
 
 /// Custom multicast group — avoids conflicts with mDNS (224.0.0.251) and LocalSend (224.0.0.167).
 /// 239.255.x.x is the "Organization-Local Scope" range, appropriate for app-defined use.
@@ -42,16 +43,6 @@ fn bind_multicast_recv() -> std::io::Result<std::net::UdpSocket> {
     Ok(socket.into())
 }
 
-/// Resolve the local WiFi IPv4 address via connect-without-send trick.
-fn local_wifi_ip() -> Option<Ipv4Addr> {
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect("8.8.8.8:80").ok()?;
-    match sock.local_addr().ok()?.ip() {
-        IpAddr::V4(v4) => Some(v4),
-        _ => None,
-    }
-}
-
 /// Build a sending socket with IP_MULTICAST_IF set to the local WiFi interface.
 /// Without this, iOS returns "No route to host" (os error 65) for multicast sends.
 fn bind_multicast_send() -> std::io::Result<std::net::UdpSocket> {
@@ -70,39 +61,62 @@ fn bind_multicast_send() -> std::io::Result<std::net::UdpSocket> {
 
 /// Continuously sends discovery announcements to the multicast group every 500 ms.
 /// Stops when dropped.
+///
+/// On iOS this is a no-op: the `com.apple.developer.networking.multicast`
+/// entitlement (Apple-approval required) is needed to send on custom multicast
+/// groups, and without it every packet fails with EHOSTUNREACH.  LAN discovery
+/// on iOS falls through to UDP broadcast and the system Bonjour daemon instead.
 pub async fn start_multicast(code: &str, quic_port: u16) -> Result<LanMulticaster> {
-    let msg = format!("{}{}: {}", PREFIX, code.to_uppercase(), quic_port);
-    let msg_bytes = msg.into_bytes();
-    let dest: SocketAddr = SocketAddr::V4(SocketAddrV4::new(MULTICAST_ADDR, MULTICAST_PORT));
+    #[cfg(target_os = "ios")]
+    {
+        eprintln!("[mcast] iOS: custom multicast disabled — relying on broadcast + mDNS");
+        return Ok(LanMulticaster {
+            task: tokio::spawn(std::future::pending()),
+        });
+    }
 
-    let std_sender = bind_multicast_send()
-        .map_err(|e| Error::ConnectionFailed(format!("multicast sender bind: {e}")))?;
-    let sender = UdpSocket::from_std(std_sender)
-        .map_err(|e| Error::ConnectionFailed(format!("multicast sender async: {e}")))?;
+    #[cfg(not(target_os = "ios"))]
+    {
+        let msg = format!("{}{}: {}", PREFIX, code.to_uppercase(), quic_port);
+        let msg_bytes = msg.into_bytes();
+        let dest: SocketAddr = SocketAddr::V4(SocketAddrV4::new(MULTICAST_ADDR, MULTICAST_PORT));
 
-    eprintln!(
-        "[mcast] announcing {} → port {} on {}:{}",
-        code.to_uppercase(),
-        quic_port,
-        MULTICAST_ADDR,
-        MULTICAST_PORT
-    );
+        let std_sender = bind_multicast_send()
+            .map_err(|e| Error::ConnectionFailed(format!("multicast sender bind: {e}")))?;
+        let sender = UdpSocket::from_std(std_sender)
+            .map_err(|e| Error::ConnectionFailed(format!("multicast sender async: {e}")))?;
 
-    let task = tokio::spawn(async move {
-        loop {
-            if let Err(e) = sender.send_to(&msg_bytes, dest).await {
-                eprintln!("[mcast] send error: {e}");
+        eprintln!(
+            "[mcast] announcing {} → port {} on {}:{}",
+            code.to_uppercase(),
+            quic_port,
+            MULTICAST_ADDR,
+            MULTICAST_PORT
+        );
+
+        let task = tokio::spawn(async move {
+            loop {
+                if let Err(e) = sender.send_to(&msg_bytes, dest).await {
+                    eprintln!("[mcast] send error: {e}");
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    });
+        });
 
-    Ok(LanMulticaster { task })
+        Ok(LanMulticaster { task })
+    }
 }
 
 /// Listen for a multicast announcement matching `code`.
 /// Returns the sender's QUIC SocketAddr (their LAN IP + QUIC port).
+///
+/// On iOS this immediately returns `Err` so the caller's `tokio::select!`
+/// arm is disabled — broadcast and mDNS carry LAN discovery instead.
 pub async fn listen_for_multicast(code: &str) -> Result<SocketAddr> {
+    #[cfg(target_os = "ios")]
+    return Err(Error::ConnectionFailed(
+        "iOS: custom multicast receive disabled".into(),
+    ));
     let code_upper = code.to_uppercase();
 
     let std_socket =

@@ -169,7 +169,7 @@ pub async fn announce_and_connect(
     dht: &DhtLayer,
 ) -> Result<(String, Session)> {
     let code = generate_share_code();
-    let session = announce_and_connect_with_code(identity, dht, &code.display).await?;
+    let session = announce_and_connect_with_code(identity, dht, &code.display, true).await?;
     Ok((code.display, session))
 }
 
@@ -179,6 +179,7 @@ pub async fn announce_and_connect_with_code(
     identity: &UserIdentity,
     dht: &DhtLayer,
     code: &str,
+    allow_relay: bool,
 ) -> Result<Session> {
     let private_key = identity.private_key_bytes();
     let expires_in = secs_until_expiry();
@@ -273,10 +274,14 @@ pub async fn announce_and_connect_with_code(
             eprintln!("[announce] receiver found at {}", receiver_addr);
 
             // Same-NAT: receiver shares our external IP → hairpin NAT → hole punch guaranteed to fail.
-            // Give the LAN (mDNS) branch a head start, then go straight to relay.
+            // Give the LAN (mDNS) branch a head start, then fall to relay (or error if relay disabled).
             if own_ext_ip.map(|ip| ip == receiver_addr.ip()).unwrap_or(false) {
                 eprintln!("[announce] same network detected — skipping hole punch, waiting for LAN path...");
                 sleep(Duration::from_secs(7)).await;
+                if !allow_relay {
+                    eprintln!("[announce] LAN path didn't win and relay is disabled — failing");
+                    return Err(Error::ConnectionFailed("same-NAT: LAN path failed and relay is disabled".into()));
+                }
                 eprintln!("[announce] LAN path didn't win — connecting via relay (same-NAT)...");
                 let tcp = connect_via_relay(&code_display).await?;
                 let (mut rh, mut wh) = tcp.into_split();
@@ -315,6 +320,10 @@ pub async fn announce_and_connect_with_code(
                 Err(Error::HolePunchTimeout) => {
                     drop(punch_socket);
                     drop(internet_server_cfg);
+                    if !allow_relay {
+                        eprintln!("[announce] hole punch timed out and relay is disabled — failing");
+                        return Err(Error::ConnectionFailed("hole punch timed out and relay is disabled".into()));
+                    }
                     eprintln!("[announce] hole punch timed out — falling back to relay...");
                     let tcp = connect_via_relay(&code_display).await?;
                     let (mut rh, mut wh) = tcp.into_split();
@@ -344,6 +353,7 @@ pub async fn lookup_and_connect(
     identity: &UserIdentity,
     code: &str,
     dht: &DhtLayer,
+    allow_relay: bool,
 ) -> Result<Session> {
     let code_upper = code.to_uppercase();
     let private_key = identity.private_key_bytes();
@@ -361,6 +371,7 @@ pub async fn lookup_and_connect(
                 tokio::select! {
                     Ok(addr) = lan_multicast::listen_for_multicast(&code_upper) => addr,
                     Ok(addr) = lan_broadcast::listen_for_broadcast(&code_upper) => addr,
+                    Ok(addr) = mdns::browse_for_code(&code_upper) => addr,
                 }
             })
             .await
@@ -387,11 +398,12 @@ pub async fn lookup_and_connect(
         } => session,
 
         // Internet path — DHT lookup + back-announce + hole punch (relay fallback).
-        // Brief initial delay so LAN mDNS has a chance to win on same-network transfers.
-        result = async {
+        // Uses Ok(session) = pattern so DHT misses disable this arm without killing the LAN path.
+        // lookup_with_retry waits up to 30 s for DHT propagation before giving up.
+        Ok(session) = async {
             sleep(Duration::from_millis(800)).await;
             let sender_addr = dht
-                .lookup(infohash_send)
+                .lookup_with_retry(infohash_send, Duration::from_secs(30), Duration::from_secs(2))
                 .await
                 .into_iter()
                 .next()
@@ -420,8 +432,12 @@ pub async fn lookup_and_connect(
                 eprintln!("[connect] same network detected — skipping hole punch, preferring LAN...");
                 dht.announce(infohash_recv, announce_port).await;
                 sleep(Duration::from_secs(8)).await;
-                eprintln!("[connect] LAN path timed out — connecting via relay (same-NAT)...");
                 drop(socket);
+                if !allow_relay {
+                    eprintln!("[connect] LAN path timed out and relay is disabled — failing");
+                    return Err(Error::ConnectionFailed("same-NAT: LAN path failed and relay is disabled".into()));
+                }
+                eprintln!("[connect] LAN path timed out — connecting via relay (same-NAT)...");
                 let tcp = connect_via_relay(&code_upper).await?;
                 let (mut rh, mut wh) = tcp.into_split();
                 let hs = perform_handshake(&mut wh, &mut rh, &private_key, HandshakeRole::Initiator).await?;
@@ -465,6 +481,10 @@ pub async fn lookup_and_connect(
 
                 Err(Error::HolePunchTimeout) => {
                     drop(socket);
+                    if !allow_relay {
+                        eprintln!("[connect] hole punch timed out and relay is disabled — failing");
+                        return Err(Error::ConnectionFailed("hole punch timed out and relay is disabled".into()));
+                    }
                     eprintln!("[connect] hole punch timed out — falling back to relay...");
                     let tcp = connect_via_relay(&code_upper).await?;
                     let (mut rh, mut wh) = tcp.into_split();
@@ -476,7 +496,9 @@ pub async fn lookup_and_connect(
 
                 Err(e) => Err(e),
             }
-        } => result?,
+        } => session,
+
+        else => return Err(Error::PeerNotFound),
     };
 
     Ok(session)

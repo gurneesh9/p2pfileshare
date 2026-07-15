@@ -4,7 +4,10 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     session::relay_session::RelaySession,
-    transfer::manifest::{actual_chunk_size, build_manifest, ControlMessage, TransferMode},
+    transfer::{
+        manifest::{actual_chunk_size, build_manifest, ControlMessage, TransferMode},
+        progress,
+    },
     Error, Result,
 };
 
@@ -58,14 +61,29 @@ pub async fn send_file_relay(session: &RelaySession, file_path: &Path) -> Result
         .filter(|i| !chunks_to_skip.contains(i))
         .collect();
 
+    // Reset progress; pre-credit already-skipped bytes for accurate resume bar.
+    progress::reset(manifest.total_size);
+    let initial_done: u64 = chunks_to_skip
+        .iter()
+        .map(|&i| actual_chunk_size(i, manifest.chunk_size, manifest.total_size) as u64)
+        .sum();
+    if initial_done > 0 {
+        progress::advance(initial_done);
+    }
+
     eprintln!(
         "[send/relay] sending {}/{} chunks...",
         to_send.len(),
         manifest.chunk_count
     );
 
+    // Advance progress as chunks are written to the relay TCP buffer.
+    // This shows real upload speed (sender → relay); the bar reaches 100% when
+    // the upload is done, then the label switches to "Sent — receiver downloading…"
+    // until the receiver's Complete message arrives and the screen transitions.
     for &idx in &to_send {
         send_one_chunk(session, &file, idx, manifest.chunk_size, manifest.total_size).await?;
+        progress::advance(actual_chunk_size(idx, manifest.chunk_size, manifest.total_size) as u64);
     }
 
     // ── NACK/Complete loop ─────────────────────────────────────────────────────

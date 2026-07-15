@@ -1,25 +1,16 @@
 use std::path::Path;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::task::JoinSet;
 
 use crate::{session::{coordinator::PeerSession, Session}, Error, Result};
 
 use super::{
-    manifest::{actual_chunk_size, build_manifest, parallel_streams_for, ControlMessage, FileManifest, TransferMode},
+    manifest::{actual_chunk_size, build_manifest, ControlMessage, FileManifest},
+    progress,
     relay_sender::send_file_relay,
 };
 
-const MAX_BYTES_IN_FLIGHT: usize = 32 * 1024 * 1024; // 32MB
-
-/// Build manifest, negotiate with receiver, send all chunks, handle NACKs.
-///
-/// Works transparently over both direct QUIC (`Session::Direct`) and relay
-/// TCP (`Session::Relay`) connections.
+/// Build manifest, negotiate with receiver, send all chunks on a single QUIC
+/// uni-stream, then handle NACKs until the receiver sends Complete.
 pub async fn send_file(session: &Session, file_path: &Path) -> Result<()> {
     match session {
         Session::Direct(s) => send_file_direct(s, file_path).await,
@@ -28,26 +19,22 @@ pub async fn send_file(session: &Session, file_path: &Path) -> Result<()> {
 }
 
 async fn send_file_direct(session: &PeerSession, file_path: &Path) -> Result<()> {
-    // ── Build manifest ─────────────────────────────────────────────────────────
-    eprintln!("[send] hashing {}...", file_path.display());
+    eprintln!("[send] building manifest for {}...", file_path.display());
     let manifest = build_manifest(file_path).await?;
     eprintln!(
         "[send] {} chunks × {} bytes, {} bytes total",
         manifest.chunk_count, manifest.chunk_size, manifest.total_size
     );
 
-    // ── Open file once — no per-chunk open/close ───────────────────────────────
-    let file = Arc::new(AsyncMutex::new(tokio::fs::File::open(file_path).await?));
+    let mut file = tokio::fs::File::open(file_path).await?;
 
-    // ── Open control stream ────────────────────────────────────────────────────
+    // ── Control bi-stream ──────────────────────────────────────────────────────
     let (mut ctrl_send, mut ctrl_recv) = session
         .connection
         .open_bi()
         .await
         .map_err(|e| Error::Quic(e.to_string()))?;
 
-    // ── Send manifest ──────────────────────────────────────────────────────────
-    eprintln!("[send] sending manifest...");
     session
         .send_ctrl(&mut ctrl_send, &ControlMessage::Manifest(manifest.clone()))
         .await?;
@@ -73,7 +60,29 @@ async fn send_file_direct(session: &PeerSession, file_path: &Path) -> Result<()>
             }
         };
 
-    // ── Send chunks ────────────────────────────────────────────────────────────
+    // Pre-credit already-done bytes so the progress bar starts at the right %.
+    progress::reset(manifest.total_size);
+    let initial_done: u64 = chunks_to_skip
+        .iter()
+        .map(|&i| actual_chunk_size(i, manifest.chunk_size, manifest.total_size) as u64)
+        .sum();
+    if initial_done > 0 {
+        progress::advance(initial_done);
+    }
+
+    // ── Single data uni-stream ─────────────────────────────────────────────────
+    // All chunk payloads flow over one persistent stream instead of one stream
+    // per chunk.  This eliminates per-stream QUIC setup/teardown overhead and
+    // lets QUIC pipeline data with a single send window.
+    //
+    // Wire format per chunk: [4-byte BE chunk_index][4-byte BE payload_len][payload]
+    let mut data = session
+        .connection
+        .open_uni()
+        .await
+        .map_err(|e| Error::Quic(e.to_string()))?;
+
+    // ── Initial send ───────────────────────────────────────────────────────────
     let to_send: Vec<u32> = (0..manifest.chunk_count)
         .filter(|i| !chunks_to_skip.contains(i))
         .collect();
@@ -84,90 +93,55 @@ async fn send_file_direct(session: &PeerSession, file_path: &Path) -> Result<()>
         manifest.chunk_count
     );
 
-    dispatch_chunks(session, file.clone(), &manifest, &to_send).await?;
+    for &idx in &to_send {
+        send_chunk(session, &mut file, &mut data, idx, &manifest).await?;
+    }
 
-    // ── Handle NACKs until receiver sends Complete ─────────────────────────────
+    // ── NACK / Complete loop ───────────────────────────────────────────────────
+    // The data stream stays open so NACKed chunks can be retransmitted on it.
     loop {
         match session.recv_ctrl(&mut ctrl_recv).await? {
             ControlMessage::Complete => {
                 eprintln!("[send] transfer complete ✓");
+                data.finish().map_err(|e| Error::Quic(e.to_string()))?;
                 return Ok(());
             }
             ControlMessage::ChunkNack { index } => {
-                eprintln!("[send] NACK chunk {}, retrying", index);
-                dispatch_chunks(session, file.clone(), &manifest, &[index]).await?;
+                eprintln!("[send] NACK chunk {index}, retransmitting");
+                send_chunk(session, &mut file, &mut data, index, &manifest).await?;
             }
             ControlMessage::Error { message, .. } => {
-                return Err(Error::ConnectionFailed(format!("receiver: {}", message)));
+                return Err(Error::ConnectionFailed(format!("receiver: {message}")));
             }
             _ => {}
         }
     }
 }
 
-// ── Chunk dispatch ─────────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
-async fn dispatch_chunks(
+async fn send_chunk(
     session: &PeerSession,
-    file: Arc<AsyncMutex<tokio::fs::File>>,
+    file: &mut tokio::fs::File,
+    stream: &mut quinn::SendStream,
+    chunk_index: u32,
     manifest: &FileManifest,
-    chunk_indices: &[u32],
 ) -> Result<()> {
-    let parallel = match &manifest.transfer_mode {
-        TransferMode::Streaming(_) => 1,
-        TransferMode::Bulk => parallel_streams_for(manifest.total_size),
-    };
+    let plaintext = read_chunk(file, chunk_index, manifest.chunk_size, manifest.total_size).await?;
+    let encrypted = session.encrypt_chunk(chunk_index, &plaintext)?;
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel));
-    let bytes_in_flight = Arc::new(AtomicUsize::new(0));
-    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    stream.write_all(&chunk_index.to_be_bytes()).await?;
+    stream
+        .write_all(&(encrypted.len() as u32).to_be_bytes())
+        .await?;
+    stream.write_all(&encrypted).await?;
 
-    for &chunk_index in chunk_indices {
-        // Back-pressure: don't queue more if memory cap hit
-        while bytes_in_flight.load(Ordering::Relaxed) > MAX_BYTES_IN_FLIGHT {
-            tokio::task::yield_now().await;
-        }
-
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
-
-        // Read plaintext from the persistent handle (seek + read, no open/close).
-        let plaintext = read_chunk(&file, chunk_index, manifest.chunk_size, manifest.total_size).await?;
-
-        // Encrypt (sequential, explicit nonce — no ordering constraint on decrypt side)
-        let encrypted = session.encrypt_chunk(chunk_index, &plaintext)?;
-
-        let conn = session.connection.clone();
-        let bif = bytes_in_flight.clone();
-        let enc_len = encrypted.len();
-
-        tasks.spawn(async move {
-            bif.fetch_add(enc_len, Ordering::Relaxed);
-
-            let mut stream = conn
-                .open_uni()
-                .await
-                .map_err(|e| Error::Quic(e.to_string()))?;
-
-            // Wire: [4-byte BE chunk_index][encrypted payload]
-            stream.write_all(&chunk_index.to_be_bytes()).await?;
-            stream.write_all(&encrypted).await?;
-            stream.finish().map_err(|e| Error::Quic(e.to_string()))?;
-
-            bif.fetch_sub(enc_len, Ordering::Relaxed);
-            drop(permit);
-            Ok(())
-        });
-    }
-
-    // Collect results, surface first error
-    while let Some(res) = tasks.join_next().await {
-        res.map_err(|e| Error::ConnectionFailed(e.to_string()))??;
-    }
+    progress::advance(plaintext.len() as u64);
     Ok(())
 }
 
 async fn read_chunk(
-    file: &AsyncMutex<tokio::fs::File>,
+    file: &mut tokio::fs::File,
     chunk_index: u32,
     chunk_size: u32,
     total_size: u64,
@@ -175,8 +149,7 @@ async fn read_chunk(
     let offset = chunk_index as u64 * chunk_size as u64;
     let size = actual_chunk_size(chunk_index, chunk_size, total_size) as usize;
     let mut buf = vec![0u8; size];
-    let mut f = file.lock().await;
-    f.seek(std::io::SeekFrom::Start(offset)).await?;
-    f.read_exact(&mut buf).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    file.read_exact(&mut buf).await?;
     Ok(buf)
 }

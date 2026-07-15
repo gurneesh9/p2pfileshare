@@ -199,7 +199,7 @@ async fn run(cli: Cli) -> xend_core::Result<()> {
                 connect_via_relay_only(&identity, &code).await?
             } else {
                 let dht = DhtLayer::new()?;
-                lookup_and_connect(&identity, &code, &dht).await?
+                lookup_and_connect(&identity, &code, &dht, true).await?
             };
 
             println!();
@@ -234,7 +234,7 @@ async fn run(cli: Cli) -> xend_core::Result<()> {
             println!("Your fingerprint: {}", identity.fingerprint);
             println!("Connecting via: {}", code.to_uppercase());
 
-            let session = lookup_and_connect(&identity, &code, &dht).await?;
+            let session = lookup_and_connect(&identity, &code, &dht, true).await?;
 
             println!();
             println!("Remote peer   : {}", session.remote_fingerprint());

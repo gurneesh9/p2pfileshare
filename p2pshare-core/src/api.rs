@@ -9,8 +9,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
-
 use flutter_rust_bridge::frb;
 
 use crate::{
@@ -37,10 +35,19 @@ use crate::{
 
 static SESSION_REGISTRY: OnceLock<Mutex<HashMap<u64, Session>>> = OnceLock::new();
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
-static DHT_LAYER: OnceLock<Mutex<Option<DhtLayer>>> = OnceLock::new();
+static DHT_LAYER: OnceLock<DhtLayer> = OnceLock::new();
 
 fn sessions() -> &'static Mutex<HashMap<u64, Session>> {
     SESSION_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_dht() -> crate::Result<&'static DhtLayer> {
+    if let Some(dht) = DHT_LAYER.get() {
+        return Ok(dht);
+    }
+    let dht = DhtLayer::new()?;
+    let _ = DHT_LAYER.set(dht); // ignore Err if another thread raced us to set it
+    Ok(DHT_LAYER.get().expect("just set"))
 }
 
 fn store_session(session: Session) -> u64 {
@@ -102,6 +109,22 @@ pub fn api_clear_relay_proxy() {
 #[frb(sync)]
 pub fn api_set_data_dir(path: String) {
     crate::identity::storage::set_data_dir(std::path::PathBuf::from(path));
+}
+
+/// Initialize the DHT client in the background so it is bootstrapped before
+/// the first transfer. Call once at app startup after api_set_data_dir.
+pub async fn api_init_dht() -> Result<(), String> {
+    tokio::task::spawn_blocking(|| get_dht().map(|_| ()).map_err(|e| e.to_string()))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()))
+}
+
+/// Return (bytes_done, bytes_total) for the current or most-recent transfer.
+/// Both values are 0 before any transfer has started.
+/// Safe to call from a polling timer — never blocks.
+#[frb(sync)]
+pub fn api_transfer_progress() -> (u64, u64) {
+    crate::transfer::progress::get()
 }
 
 // ── Identity ──────────────────────────────────────────────────────────────────
@@ -199,14 +222,14 @@ pub async fn api_check_presence() -> Vec<ApiContact> {
         return vec![];
     }
 
-    let dht = match DhtLayer::new() {
+    let dht = match get_dht() {
         Ok(d) => d,
         Err(_) => {
             return contacts.into_iter().map(contact_to_api).collect();
         }
     };
 
-    let statuses = check_presence(&contacts, &dht).await;
+    let statuses = check_presence(&contacts, dht).await;
 
     contacts
         .into_iter()
@@ -247,8 +270,21 @@ pub async fn api_begin_send(code: String) -> Result<u64, String> {
     let identity = load()
         .map_err(|e| e.to_string())?
         .ok_or("no identity")?;
-    let dht = DhtLayer::new().map_err(|e| e.to_string())?;
-    let session = announce_and_connect_with_code(&identity, &dht, &code)
+    let dht = get_dht().map_err(|e| e.to_string())?;
+    let session = announce_and_connect_with_code(&identity, dht, &code, true)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(store_session(session))
+}
+
+/// Phase 2 of send — DHT + hole punch only, relay disabled.
+/// Returns an error rather than silently falling back to relay.
+pub async fn api_begin_send_dht_only(code: String) -> Result<u64, String> {
+    let identity = load()
+        .map_err(|e| e.to_string())?
+        .ok_or("no identity")?;
+    let dht = get_dht().map_err(|e| e.to_string())?;
+    let session = announce_and_connect_with_code(&identity, dht, &code, false)
         .await
         .map_err(|e| e.to_string())?;
     Ok(store_session(session))
@@ -388,9 +424,9 @@ pub async fn api_create_send_session() -> Result<(String, u64), String> {
     let identity = load()
         .map_err(|e| e.to_string())?
         .ok_or("no identity")?;
-    let dht = DhtLayer::new().map_err(|e| e.to_string())?;
+    let dht = get_dht().map_err(|e| e.to_string())?;
 
-    let (code, session) = announce_and_connect(&identity, &dht)
+    let (code, session) = announce_and_connect(&identity, dht)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -411,9 +447,26 @@ pub async fn api_connect_to_code(code: String) -> Result<(u64, String), String> 
     let identity = load()
         .map_err(|e| e.to_string())?
         .ok_or("no identity")?;
-    let dht = DhtLayer::new().map_err(|e| e.to_string())?;
+    let dht = get_dht().map_err(|e| e.to_string())?;
 
-    let session = lookup_and_connect(&identity, &code, &dht)
+    let session = lookup_and_connect(&identity, &code, dht, true)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let fingerprint = session.remote_fingerprint().to_string();
+    let handle = store_session(session);
+    Ok((handle, fingerprint))
+}
+
+/// Receiver: look up code via LAN/DHT only — no relay fallback.
+/// Returns an error rather than silently falling back to relay.
+pub async fn api_connect_to_code_dht_only(code: String) -> Result<(u64, String), String> {
+    let identity = load()
+        .map_err(|e| e.to_string())?
+        .ok_or("no identity")?;
+    let dht = get_dht().map_err(|e| e.to_string())?;
+
+    let session = lookup_and_connect(&identity, &code, dht, false)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -459,8 +512,8 @@ pub async fn api_connect_to_contact(contact_id: String) -> Result<(u64, String),
         .find(|c| c.id == uuid)
         .ok_or("contact not found")?;
 
-    let dht = DhtLayer::new().map_err(|e| e.to_string())?;
-    let session = connect_to_contact(&identity, &contact, &dht)
+    let dht = get_dht().map_err(|e| e.to_string())?;
+    let session = connect_to_contact(&identity, &contact, dht)
         .await
         .map_err(|e| e.to_string())?;
 

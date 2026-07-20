@@ -127,13 +127,16 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
     // until `pending` is empty rather than until stream EOF.
     let mut pending: HashSet<u32> = state.missing_chunks().into_iter().collect();
     let mut chunks_since_save = 0u32;
+    // Bytes fully received, decrypted, and written — reported to the sender so
+    // its progress bar reflects confirmed delivery, not buffered writes.
+    let mut confirmed: u64 = initial_done;
     // Noise wraps each 65519-byte sub-message with 4-byte length + 16-byte tag,
     // plus 2 bytes for sub_count. ceil(chunk/65519)*20+2 ≤ chunk/3000 for any
     // chunk size, so chunk/2048 gives comfortable headroom.
     let max_payload = manifest.chunk_size as usize + manifest.chunk_size as usize / 2048 + 4096;
 
     while !pending.is_empty() {
-        // ── Read header ────────────────────────────────────────────────────────
+        // ── Read outer header ──────────────────────────────────────────────────
         let mut idx_buf = [0u8; 4];
         data.read_exact(&mut idx_buf).await?;
         let chunk_index = u32::from_be_bytes(idx_buf);
@@ -148,31 +151,64 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
             )));
         }
 
-        // ── Read payload ───────────────────────────────────────────────────────
-        let mut ciphertext = vec![0u8; payload_len];
-        data.read_exact(&mut ciphertext).await?;
+        // ── Read sub_count ─────────────────────────────────────────────────────
+        let mut sub_count_buf = [0u8; 2];
+        data.read_exact(&mut sub_count_buf).await?;
+        let sub_count = u16::from_be_bytes(sub_count_buf) as u32;
 
-        // Skip chunks already received (e.g. a retransmit arriving after a
-        // previous retransmit already filled the slot).
-        if !pending.contains(&chunk_index) {
+        // ── Read + decrypt sub-messages one at a time ──────────────────────────
+        // Each sub-message is ≤ 65535 bytes, so progress advances every ~64 KB
+        // as data arrives from the network rather than once per chunk (8–16 MB).
+        let is_pending = pending.contains(&chunk_index);
+        let mut plaintext = Vec::new();
+        let mut decrypt_failed = false;
+        let mut advanced: u64 = 0;
+
+        for sub_idx in 0..sub_count {
+            let mut sub_len_buf = [0u8; 4];
+            data.read_exact(&mut sub_len_buf).await?;
+            let sub_len = u32::from_be_bytes(sub_len_buf) as usize;
+            if sub_len > 65535 {
+                return Err(Error::ConnectionFailed(format!(
+                    "chunk {chunk_index} sub {sub_idx} len {sub_len} exceeds Noise max"
+                )));
+            }
+            let mut sub_ciphertext = vec![0u8; sub_len];
+            data.read_exact(&mut sub_ciphertext).await?;
+
+            if !is_pending || decrypt_failed {
+                continue; // drain stream bytes without processing
+            }
+
+            match session.decrypt_sub_message(chunk_index, sub_idx, &sub_ciphertext) {
+                Ok(sub_plain) => {
+                    progress::advance(sub_plain.len() as u64);
+                    advanced += sub_plain.len() as u64;
+                    plaintext.extend(sub_plain);
+                }
+                Err(e) => {
+                    eprintln!("[recv] chunk {chunk_index} sub {sub_idx} decrypt failed: {e}");
+                    progress::retract(advanced);
+                    advanced = 0;
+                    decrypt_failed = true;
+                }
+            }
+        }
+
+        // Skip already-received chunks (drained above).
+        if !is_pending {
             continue;
         }
 
-        // ── Decrypt ────────────────────────────────────────────────────────────
-        let plaintext = match session.decrypt_chunk(chunk_index, &ciphertext) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[recv] chunk {chunk_index} decrypt failed ({e}) — NACKing");
-                session
-                    .send_ctrl(
-                        &mut ctrl_send,
-                        &ControlMessage::ChunkNack { index: chunk_index },
-                    )
-                    .await?;
-                continue;
-            }
-        };
+        // ── NACK on decrypt failure ────────────────────────────────────────────
+        if decrypt_failed {
+            session
+                .send_ctrl(&mut ctrl_send, &ControlMessage::ChunkNack { index: chunk_index })
+                .await?;
+            continue;
+        }
 
+        // ── Size check ─────────────────────────────────────────────────────────
         let expected_size =
             actual_chunk_size(chunk_index, manifest.chunk_size, manifest.total_size) as usize;
         if plaintext.len() != expected_size {
@@ -181,11 +217,9 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
                 plaintext.len(),
                 expected_size
             );
+            progress::retract(advanced);
             session
-                .send_ctrl(
-                    &mut ctrl_send,
-                    &ControlMessage::ChunkNack { index: chunk_index },
-                )
+                .send_ctrl(&mut ctrl_send, &ControlMessage::ChunkNack { index: chunk_index })
                 .await?;
             continue;
         }
@@ -195,9 +229,15 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         file.write_all(&plaintext).await?;
 
-        progress::advance(plaintext.len() as u64);
+        // Progress already advanced per sub-message above.
         pending.remove(&chunk_index);
         state.chunks_done.insert(chunk_index);
+
+        // Report confirmed bytes so the sender's bar tracks real delivery.
+        confirmed += expected_size as u64;
+        session
+            .send_ctrl(&mut ctrl_send, &ControlMessage::Progress { bytes: confirmed })
+            .await?;
 
         let done = manifest.chunk_count as usize - pending.len();
         eprintln!(
@@ -262,13 +302,39 @@ mod tests {
         }
     }
 
+    // Transfers share the global progress counters — serialize the tests.
+    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn loopback_file_transfer() {
+        let _guard = TEST_LOCK.lock().await;
+        let content = b"Hello, P2PShare! This is a test file for loopback transfer.".to_vec();
+        run_loopback_transfer(content).await;
+    }
+
+    /// 20 MB file → three 8 MB chunks, each split into 129 Noise sub-messages.
+    /// Exercises the concurrent ctrl/send loops, read-ahead pipelining, and
+    /// receiver Progress reports on a realistic multi-chunk transfer.
+    #[tokio::test]
+    async fn loopback_multi_chunk_transfer() {
+        let _guard = TEST_LOCK.lock().await;
+        let mut content = vec![0u8; 20 * 1024 * 1024];
+        // Deterministic non-uniform pattern so corruption would be caught.
+        for (i, b) in content.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        run_loopback_transfer(content).await;
+        // The whole file must be confirmed done once the transfer returns.
+        let (done, total) = crate::transfer::progress::get();
+        assert_eq!(done, total);
+        assert_eq!(total, 20 * 1024 * 1024);
+    }
+
+    async fn run_loopback_transfer(content: Vec<u8>) {
         // Create a temp file to send
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("hello.txt");
-        let content = b"Hello, P2PShare! This is a test file for loopback transfer.";
-        tokio::fs::write(&src, content).await.unwrap();
+        tokio::fs::write(&src, &content).await.unwrap();
 
         let out_dir = tmp.path().join("recv");
         tokio::fs::create_dir_all(&out_dir).await.unwrap();

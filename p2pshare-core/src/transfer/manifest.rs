@@ -46,6 +46,10 @@ pub enum ControlMessage {
     ManifestAck,
     ResumeRequest { have_chunks: Vec<u32> },
     ChunkNack { index: u32 },
+    /// Receiver → sender: absolute count of bytes received, decrypted, and
+    /// authenticated so far. Drives the sender's progress bar so it reflects
+    /// confirmed delivery rather than locally-buffered writes.
+    Progress { bytes: u64 },
     Complete,
     Error { code: u32, message: String },
 }
@@ -54,9 +58,11 @@ pub enum ControlMessage {
 
 pub fn chunk_size_for(file_size: u64) -> u32 {
     match file_size {
-        0..=5_000_000 => 524_288,            // 512 KB  for files ≤ 5 MB
-        5_000_001..=500_000_000 => 8_388_608, // 8 MB   for files ≤ 500 MB
-        _ => 16_777_216,                      // 16 MB  for large files
+        0..=5_000_000 => 524_288, // 512 KB for files ≤ 5 MB
+        // 8 MB for everything else. Larger chunks don't help throughput (all
+        // chunks flow on one persistent stream) but cost more memory per chunk
+        // and make a NACK retransmit more expensive.
+        _ => 8_388_608,
     }
 }
 

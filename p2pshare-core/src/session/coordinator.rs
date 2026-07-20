@@ -29,12 +29,10 @@ use crate::{
         relay::{connect_via_relay, connect_via_relay_at},
         stun::external_addr,
     },
-    session::{relay_session::RelaySession, Session},
+    session::{chunk_nonce, relay_session::RelaySession, Session},
     transfer::manifest::ControlMessage,
     Error, Result,
 };
-
-const CHUNK_NONCE_BASE: u64 = 1 << 32;
 
 // ── PeerSession ────────────────────────────────────────────────────────────────
 
@@ -92,6 +90,16 @@ impl PeerSession {
             .map_err(|e| Error::MsgPack(e.to_string()))
     }
 
+    /// Decrypt one Noise sub-message received from the stream.
+    pub fn decrypt_sub_message(&self, chunk_index: u32, sub_index: u32, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        const MAX_PLAIN: usize = 65519;
+        let mut buf = vec![0u8; MAX_PLAIN];
+        let len = self.noise.lock().unwrap()
+            .read_message(chunk_nonce(chunk_index, sub_index), ciphertext, &mut buf)
+            .map_err(|e| Error::Noise(e.to_string()))?;
+        Ok(buf[..len].to_vec())
+    }
+
     pub fn encrypt_chunk(&self, chunk_index: u32, plaintext: &[u8]) -> Result<Vec<u8>> {
         const MAX_PLAIN: usize = 65519;
         let mut out = Vec::with_capacity(plaintext.len() + 32);
@@ -99,10 +107,9 @@ impl PeerSession {
         out.extend_from_slice(&sub_count.to_be_bytes());
         let noise = self.noise.lock().unwrap();
         for (i, sub) in plaintext.chunks(MAX_PLAIN).enumerate() {
-            let nonce = CHUNK_NONCE_BASE + chunk_index as u64 * 256 + i as u64;
             let mut buf = vec![0u8; sub.len() + 16];
             let len = noise
-                .write_message(nonce, sub, &mut buf)
+                .write_message(chunk_nonce(chunk_index, i as u32), sub, &mut buf)
                 .map_err(|e| Error::Noise(e.to_string()))?;
             out.extend_from_slice(&(len as u32).to_be_bytes());
             out.extend_from_slice(&buf[..len]);
@@ -129,10 +136,9 @@ impl PeerSession {
             if pos + sub_len > ciphertext.len() {
                 return Err(Error::Noise("truncated sub-message body".into()));
             }
-            let nonce = CHUNK_NONCE_BASE + chunk_index as u64 * 256 + i as u64;
             let mut buf = vec![0u8; MAX_PLAIN];
             let len = noise
-                .read_message(nonce, &ciphertext[pos..pos + sub_len], &mut buf)
+                .read_message(chunk_nonce(chunk_index, i as u32), &ciphertext[pos..pos + sub_len], &mut buf)
                 .map_err(|e| Error::Noise(e.to_string()))?;
             out.extend_from_slice(&buf[..len]);
             pos += sub_len;

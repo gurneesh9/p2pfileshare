@@ -77,33 +77,44 @@ pub async fn send_file_relay(session: &RelaySession, file_path: &Path) -> Result
         manifest.chunk_count
     );
 
-    // Advance progress as chunks are written to the relay TCP buffer.
-    // This shows real upload speed (sender → relay); the bar reaches 100% when
-    // the upload is done, then the label switches to "Sent — receiver downloading…"
-    // until the receiver's Complete message arrives and the screen transitions.
-    for &idx in &to_send {
-        send_one_chunk(session, &file, idx, manifest.chunk_size, manifest.total_size).await?;
-        progress::advance(actual_chunk_size(idx, manifest.chunk_size, manifest.total_size) as u64);
-    }
-
-    // ── NACK/Complete loop ─────────────────────────────────────────────────────
-    loop {
-        match session.recv_ctrl_msg().await? {
-            ControlMessage::Complete => {
-                eprintln!("[send/relay] transfer complete ✓");
-                return Ok(());
-            }
-            ControlMessage::ChunkNack { index } => {
-                eprintln!("[send/relay] NACK chunk {index} — retransmitting");
-                send_one_chunk(session, &file, index, manifest.chunk_size, manifest.total_size)
-                    .await?;
-            }
-            ControlMessage::Error { message, .. } => {
-                return Err(Error::ConnectionFailed(format!("receiver: {message}")));
-            }
-            _ => {}
+    // ── Concurrent send + ctrl loops ───────────────────────────────────────────
+    // The relay TCP stream is full-duplex, and the session's read/write halves
+    // are behind separate async mutexes, so the ctrl loop can retransmit a
+    // NACKed chunk while the send loop is between chunks.  The progress bar is
+    // driven only by the receiver's Progress reports (confirmed, decrypted
+    // bytes) — writes into the TCP buffer say nothing about delivery.
+    let send_loop = async {
+        for &idx in &to_send {
+            send_one_chunk(session, &file, idx, manifest.chunk_size, manifest.total_size).await?;
         }
-    }
+        eprintln!("[send/relay] all chunks written — waiting for receiver");
+        Ok(())
+    };
+
+    let ctrl_loop = async {
+        loop {
+            match session.recv_ctrl_msg().await? {
+                ControlMessage::Progress { bytes } => progress::set_done(bytes),
+                ControlMessage::Complete => {
+                    progress::set_done(manifest.total_size);
+                    eprintln!("[send/relay] transfer complete ✓");
+                    return Ok(());
+                }
+                ControlMessage::ChunkNack { index } => {
+                    eprintln!("[send/relay] NACK chunk {index} — retransmitting");
+                    send_one_chunk(session, &file, index, manifest.chunk_size, manifest.total_size)
+                        .await?;
+                }
+                ControlMessage::Error { message, .. } => {
+                    return Err(Error::ConnectionFailed(format!("receiver: {message}")));
+                }
+                _ => {}
+            }
+        }
+    };
+
+    tokio::try_join!(send_loop, ctrl_loop)?;
+    Ok(())
 }
 
 async fn send_one_chunk(

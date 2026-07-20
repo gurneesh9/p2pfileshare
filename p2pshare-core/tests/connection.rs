@@ -80,7 +80,7 @@ async fn lan_path_wins_when_dht_empty() {
     let sender_task = tokio::spawn(async move {
         let session = timeout(
             Duration::from_secs(20),
-            announce_and_connect_with_code(&sender_id, &sender_dht, &code_s),
+            announce_and_connect_with_code(&sender_id, &sender_dht, &code_s, false),
         )
         .await
         .expect("sender timed out waiting for peer")
@@ -99,7 +99,7 @@ async fn lan_path_wins_when_dht_empty() {
     let receiver_dht = DhtLayer::new().unwrap();
     let recv_session = timeout(
         Duration::from_secs(15),
-        lookup_and_connect(&receiver_id, &code, &receiver_dht),
+        lookup_and_connect(&receiver_id, &code, &receiver_dht, false),
     )
     .await
     .expect("receiver timed out waiting for sender")

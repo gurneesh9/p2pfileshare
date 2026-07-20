@@ -97,6 +97,8 @@ pub async fn receive_file_relay(session: &RelaySession, output_dir: &Path) -> Re
     }
 
     let mut pending: HashSet<u32> = state.missing_chunks().into_iter().collect();
+    // Bytes fully received, decrypted, and written — reported to the sender.
+    let mut confirmed: u64 = initial_done;
 
     while !pending.is_empty() {
         match session.recv_msg().await? {
@@ -132,6 +134,11 @@ pub async fn receive_file_relay(session: &RelaySession, output_dir: &Path) -> Re
                 progress::advance(plaintext.len() as u64);
                 pending.remove(&chunk_index);
                 state.chunks_done.insert(chunk_index);
+                // Report confirmed bytes so the sender's bar tracks delivery.
+                confirmed += plaintext.len() as u64;
+                session
+                    .send_ctrl(&ControlMessage::Progress { bytes: confirmed })
+                    .await?;
                 // Throttled async save — same as direct receiver.
                 if state.chunks_done.len() % 16 == 0 {
                     let s = state.clone();

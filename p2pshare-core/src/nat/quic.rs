@@ -102,6 +102,14 @@ fn p2p_transport_config() -> quinn::TransportConfig {
     // probe round-trips it would trigger, giving ~17% more payload per packet
     // from the very first frame.
     t.initial_mtu(1400);
+    // Keep the hole-punched NAT binding warm during quiet periods, and detect
+    // a dead peer within 30 s so a stalled transfer errors out (and can be
+    // resumed) instead of hanging forever.
+    t.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    t.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30))
+            .expect("30s fits in VarInt"),
+    ));
     t
 }
 

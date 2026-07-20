@@ -10,10 +10,7 @@ use tokio::{
     },
 };
 
-use crate::{transfer::manifest::ControlMessage, Error, Result};
-
-// Must stay in sync with coordinator's CHUNK_NONCE_BASE.
-const CHUNK_NONCE_BASE: u64 = 1 << 32;
+use crate::{session::chunk_nonce, transfer::manifest::ControlMessage, Error, Result};
 
 // ── Wire message types ─────────────────────────────────────────────────────────
 
@@ -98,10 +95,12 @@ impl RelaySession {
     /// Send an already-encrypted chunk payload:
     /// `[0x01][4-byte chunk_index][4-byte payload_len][payload]`
     pub async fn send_chunk_raw(&self, chunk_index: u32, payload: &[u8]) -> Result<()> {
+        let mut header = [0u8; 9];
+        header[0] = 0x01;
+        header[1..5].copy_from_slice(&chunk_index.to_be_bytes());
+        header[5..9].copy_from_slice(&(payload.len() as u32).to_be_bytes());
         let mut w = self.write.lock().await;
-        w.write_all(&[0x01]).await?;
-        w.write_all(&chunk_index.to_be_bytes()).await?;
-        w.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+        w.write_all(&header).await?;
         w.write_all(payload).await?;
         Ok(())
     }
@@ -180,10 +179,9 @@ impl RelaySession {
         out.extend_from_slice(&sub_count.to_be_bytes());
         let noise = self.noise.lock().unwrap();
         for (i, sub) in plaintext.chunks(MAX_PLAIN).enumerate() {
-            let nonce = CHUNK_NONCE_BASE + chunk_index as u64 * 256 + i as u64;
             let mut buf = vec![0u8; sub.len() + 16];
             let len = noise
-                .write_message(nonce, sub, &mut buf)
+                .write_message(chunk_nonce(chunk_index, i as u32), sub, &mut buf)
                 .map_err(|e| Error::Noise(e.to_string()))?;
             out.extend_from_slice(&(len as u32).to_be_bytes());
             out.extend_from_slice(&buf[..len]);
@@ -210,10 +208,9 @@ impl RelaySession {
             if pos + sub_len > ciphertext.len() {
                 return Err(Error::Noise("truncated sub-message body".into()));
             }
-            let nonce = CHUNK_NONCE_BASE + chunk_index as u64 * 256 + i as u64;
             let mut buf = vec![0u8; MAX_PLAIN];
             let len = noise
-                .read_message(nonce, &ciphertext[pos..pos + sub_len], &mut buf)
+                .read_message(chunk_nonce(chunk_index, i as u32), &ciphertext[pos..pos + sub_len], &mut buf)
                 .map_err(|e| Error::Noise(e.to_string()))?;
             out.extend_from_slice(&buf[..len]);
             pos += sub_len;

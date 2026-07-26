@@ -127,6 +127,15 @@ pub fn api_transfer_progress() -> (u64, u64) {
     crate::transfer::progress::get()
 }
 
+/// Current connection-establishment phase, as a small code the UI maps to a
+/// message: 0 idle, 1 announcing, 2 waiting-for-peer, 3 peer-found,
+/// 4 hole-punching, 5 connecting, 6 handshaking, 7 connected, 8 relay-connecting.
+/// Safe to call from a polling timer — never blocks.
+#[frb(sync)]
+pub fn api_connection_phase() -> u8 {
+    crate::transfer::conn_status::get()
+}
+
 // ── Identity ──────────────────────────────────────────────────────────────────
 
 /// Load the stored identity, or None if none exists yet.

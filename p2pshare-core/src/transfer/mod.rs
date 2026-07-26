@@ -1,3 +1,4 @@
+pub mod conn_status;
 pub mod manifest;
 pub mod progress;
 pub mod receiver;

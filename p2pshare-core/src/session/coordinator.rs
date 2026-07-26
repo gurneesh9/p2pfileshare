@@ -27,10 +27,10 @@ use crate::{
             skip_verify_client_config,
         },
         relay::{connect_via_relay, connect_via_relay_at},
-        stun::external_addr,
+        stun::{detect_nat_mapping, external_addr, NatMapping},
     },
     session::{chunk_nonce, relay_session::RelaySession, Session},
-    transfer::manifest::ControlMessage,
+    transfer::{conn_status, manifest::ControlMessage},
     Error, Result,
 };
 
@@ -239,8 +239,10 @@ pub async fn announce_and_connect_with_code(
     };
 
     eprintln!("[announce] announcing on DHT, port {}", announce_port);
+    conn_status::set(conn_status::ANNOUNCING);
     dht.announce(infohash_send, announce_port).await;
     eprintln!("[announce] waiting for receiver (LAN or internet)...");
+    conn_status::set(conn_status::WAITING_FOR_PEER);
 
     // ── Race: first connection wins ─────────────────────────────────────────────
     let code_display = code.to_string();
@@ -267,6 +269,7 @@ pub async fn announce_and_connect_with_code(
                 match perform_handshake(&mut send, &mut recv, &private_key, HandshakeRole::Responder).await {
                     Ok(hs) => {
                         eprintln!("[announce] LAN: connected to {}", to_fingerprint(&hs.remote_pubkey));
+                        conn_status::set(conn_status::CONNECTED);
                         break Ok(Session::Direct(make_peer_session(conn, hs.remote_pubkey, hs.transport)));
                     }
                     Err(e) => { eprintln!("[announce] LAN handshake error: {e}, retrying"); continue; }
@@ -284,6 +287,7 @@ pub async fn announce_and_connect_with_code(
                 poll_for_receiver(dht, infohash_recv, infohash_send, announce_port, wait_secs)
                     .await?;
             eprintln!("[announce] receiver found at {}", receiver_addr);
+            conn_status::set(conn_status::PEER_FOUND);
 
             // Same-NAT: receiver shares our external IP → hairpin NAT → hole punch guaranteed to fail.
             // Give the LAN (mDNS) branch a head start, then fall to relay (or error if relay disabled).
@@ -295,6 +299,7 @@ pub async fn announce_and_connect_with_code(
                     return Err(Error::ConnectionFailed("same-NAT: LAN path failed and relay is disabled".into()));
                 }
                 eprintln!("[announce] LAN path didn't win — connecting via relay (same-NAT)...");
+                conn_status::set(conn_status::RELAY_CONNECTING);
                 let tcp = connect_via_relay(&code_display).await?;
                 let (mut rh, mut wh) = tcp.into_split();
                 let hs = perform_handshake(&mut wh, &mut rh, &private_key, HandshakeRole::Responder).await?;
@@ -303,10 +308,22 @@ pub async fn announce_and_connect_with_code(
                 return Ok(Session::Relay(RelaySession::from_split(rh, wh, hs.remote_pubkey, fingerprint, hs.transport)));
             }
 
+            match detect_nat_mapping(&punch_socket).await {
+                NatMapping::AddressDependent => eprintln!(
+                    "[announce] ⚠ NAT is symmetric/port-dependent — direct hole punch will likely fail (relay needed for this network)"
+                ),
+                NatMapping::EndpointIndependent => {
+                    eprintln!("[announce] NAT is endpoint-independent — hole punch should work")
+                }
+                NatMapping::Unknown => eprintln!("[announce] NAT type unknown (STUN incomplete)"),
+            }
+
             eprintln!("[announce] hole punching...");
+            conn_status::set(conn_status::HOLE_PUNCHING);
             match hole_punch(punch_socket.clone(), receiver_addr).await {
                 Ok(()) => {
                     eprintln!("[announce] QUIC server starting (internet)...");
+                    conn_status::set(conn_status::CONNECTING);
                     let std_socket = Arc::try_unwrap(punch_socket)
                         .map_err(|_| Error::ConnectionFailed("socket still borrowed".into()))?
                         .into_std()?;
@@ -322,9 +339,11 @@ pub async fn announce_and_connect_with_code(
                         .await.map_err(|e| Error::Quic(e.to_string()))?;
 
                     eprintln!("[announce] Noise XX handshake (responder, internet)...");
+                    conn_status::set(conn_status::HANDSHAKING);
                     let (mut send, mut recv) = conn.accept_bi().await.map_err(|e| Error::Quic(e.to_string()))?;
                     let hs = perform_handshake(&mut send, &mut recv, &private_key, HandshakeRole::Responder).await?;
                     eprintln!("[announce] internet: connected to {}", to_fingerprint(&hs.remote_pubkey));
+                    conn_status::set(conn_status::CONNECTED);
 
                     Ok(Session::Direct(make_peer_session(conn, hs.remote_pubkey, hs.transport)))
                 }
@@ -337,6 +356,7 @@ pub async fn announce_and_connect_with_code(
                         return Err(Error::ConnectionFailed("hole punch timed out and relay is disabled".into()));
                     }
                     eprintln!("[announce] hole punch timed out — falling back to relay...");
+                    conn_status::set(conn_status::RELAY_CONNECTING);
                     let tcp = connect_via_relay(&code_display).await?;
                     let (mut rh, mut wh) = tcp.into_split();
                     let hs = perform_handshake(&mut wh, &mut rh, &private_key, HandshakeRole::Responder).await?;
@@ -373,6 +393,7 @@ pub async fn lookup_and_connect(
     let infohash_recv = to_recv_infohash(&code_upper);
 
     eprintln!("[connect] looking up {} (LAN + internet simultaneously)...", code_upper);
+    conn_status::set(conn_status::ANNOUNCING);
 
     let session = tokio::select! {
         // LAN path — race multicast and broadcast listeners; first one to see the sender wins.
@@ -405,6 +426,7 @@ pub async fn lookup_and_connect(
             let (mut send, mut recv) = conn.open_bi().await.map_err(|e| Error::Quic(e.to_string()))?;
             let hs = perform_handshake(&mut send, &mut recv, &private_key, HandshakeRole::Initiator).await?;
             eprintln!("[connect] LAN: connected to {}", to_fingerprint(&hs.remote_pubkey));
+            conn_status::set(conn_status::CONNECTED);
 
             Ok::<Session, Error>(Session::Direct(make_peer_session(conn, hs.remote_pubkey, hs.transport)))
         } => session,
@@ -414,6 +436,7 @@ pub async fn lookup_and_connect(
         // lookup_with_retry waits up to 30 s for DHT propagation before giving up.
         Ok(session) = async {
             sleep(Duration::from_millis(800)).await;
+            conn_status::set(conn_status::WAITING_FOR_PEER);
             let sender_addr = dht
                 .lookup_with_retry(infohash_send, Duration::from_secs(30), Duration::from_secs(2))
                 .await
@@ -421,6 +444,7 @@ pub async fn lookup_and_connect(
                 .next()
                 .ok_or(Error::PeerNotFound)?;
             eprintln!("[connect] internet: sender found at {}", sender_addr);
+            conn_status::set(conn_status::PEER_FOUND);
 
             let socket = UdpSocket::bind("0.0.0.0:0").await?;
             let local_port = socket.local_addr()?.port();
@@ -461,7 +485,18 @@ pub async fn lookup_and_connect(
             eprintln!("[connect] back-announcing on DHT, port {}...", announce_port);
             dht.announce(infohash_recv, announce_port).await;
 
+            match detect_nat_mapping(&socket).await {
+                NatMapping::AddressDependent => eprintln!(
+                    "[connect] ⚠ NAT is symmetric/port-dependent — direct hole punch will likely fail (relay needed for this network)"
+                ),
+                NatMapping::EndpointIndependent => {
+                    eprintln!("[connect] NAT is endpoint-independent — hole punch should work")
+                }
+                NatMapping::Unknown => eprintln!("[connect] NAT type unknown (STUN incomplete)"),
+            }
+
             eprintln!("[connect] hole punching...");
+            conn_status::set(conn_status::HOLE_PUNCHING);
             match hole_punch(socket.clone(), sender_addr).await {
                 Ok(()) => {
                     // Keep punching so sender completes its own hole_punch (~600ms).
@@ -471,6 +506,7 @@ pub async fn lookup_and_connect(
                     }
 
                     eprintln!("[connect] internet: QUIC connecting...");
+                    conn_status::set(conn_status::CONNECTING);
                     let std_socket = Arc::try_unwrap(socket)
                         .map_err(|_| Error::ConnectionFailed("socket still borrowed".into()))?
                         .into_std()?;
@@ -484,9 +520,11 @@ pub async fn lookup_and_connect(
                         .map_err(|e| Error::Quic(e.to_string()))?;
 
                     eprintln!("[connect] internet: Noise XX handshake (initiator)...");
+                    conn_status::set(conn_status::HANDSHAKING);
                     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| Error::Quic(e.to_string()))?;
                     let hs = perform_handshake(&mut send, &mut recv, &private_key, HandshakeRole::Initiator).await?;
                     eprintln!("[connect] internet: connected to {}", to_fingerprint(&hs.remote_pubkey));
+                    conn_status::set(conn_status::CONNECTED);
 
                     Ok(Session::Direct(make_peer_session(conn, hs.remote_pubkey, hs.transport)))
                 }
@@ -498,6 +536,7 @@ pub async fn lookup_and_connect(
                         return Err(Error::ConnectionFailed("hole punch timed out and relay is disabled".into()));
                     }
                     eprintln!("[connect] hole punch timed out — falling back to relay...");
+                    conn_status::set(conn_status::RELAY_CONNECTING);
                     let tcp = connect_via_relay(&code_upper).await?;
                     let (mut rh, mut wh) = tcp.into_split();
                     let hs = perform_handshake(&mut wh, &mut rh, &private_key, HandshakeRole::Initiator).await?;

@@ -70,6 +70,66 @@ async fn query_all(socket: &UdpSocket) -> Option<SocketAddr> {
     .flatten()
 }
 
+/// Whether the NAT's external mapping is stable across destinations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatMapping {
+    /// Same external port toward every destination — hole punching works.
+    EndpointIndependent,
+    /// Different external port per destination (symmetric / port-dependent) —
+    /// the port learned from STUN won't match the one used toward the peer, so
+    /// direct hole punching cannot succeed without a relay.
+    AddressDependent,
+    /// Couldn't determine (STUN unreachable or only one server answered).
+    Unknown,
+}
+
+/// Probe NAT mapping behaviour by asking two *different* STUN servers, on the
+/// same socket, for our external address and comparing the ports. If they agree
+/// the mapping is endpoint-independent (hole-punchable); if they differ the NAT
+/// is symmetric/port-dependent and pure P2P hole punching will not work.
+///
+/// This is diagnostic only — it logs the verdict so a failed transfer can be
+/// explained ("your network's NAT is symmetric") instead of silently timing out.
+pub async fn detect_nat_mapping(socket: &UdpSocket) -> NatMapping {
+    let servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
+    let mut ports = Vec::new();
+    for server in servers {
+        let Ok(addrs) = tokio::net::lookup_host(server).await else {
+            continue;
+        };
+        let Some(server_addr) = addrs.into_iter().find(|a| a.is_ipv4()) else {
+            continue;
+        };
+        let txn_id: [u8; 12] = rand::random();
+        if socket.send_to(&build_request(&txn_id), server_addr).await.is_err() {
+            continue;
+        }
+        let mut buf = [0u8; 512];
+        let got = tokio::time::timeout(STUN_WAIT, async {
+            loop {
+                let (len, from) = socket.recv_from(&mut buf).await.ok()?;
+                if from == server_addr {
+                    if let Some(addr) = parse_response(&buf[..len], &txn_id) {
+                        return Some(addr);
+                    }
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(addr) = got {
+            ports.push(addr.port());
+        }
+    }
+
+    match ports.as_slice() {
+        [a, b] if a == b => NatMapping::EndpointIndependent,
+        [_, _] => NatMapping::AddressDependent,
+        _ => NatMapping::Unknown,
+    }
+}
+
 fn build_request(txn_id: &[u8; 12]) -> [u8; 20] {
     let mut req = [0u8; 20];
     req[0..2].copy_from_slice(&0x0001u16.to_be_bytes()); // Binding Request

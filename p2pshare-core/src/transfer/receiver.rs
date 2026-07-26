@@ -94,7 +94,7 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
     };
 
     // ── Open write handle ──────────────────────────────────────────────────────
-    let mut file = tokio::fs::OpenOptions::new()
+    let file = tokio::fs::OpenOptions::new()
         .write(true)
         .open(&output_path)
         .await?;
@@ -127,6 +127,13 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
     // until `pending` is empty rather than until stream EOF.
     let mut pending: HashSet<u32> = state.missing_chunks().into_iter().collect();
     let mut chunks_since_save = 0u32;
+    // Disk write for the previous chunk runs in the background while we read/decrypt
+    // the next chunk off the wire, so network throughput isn't gated on disk latency.
+    let mut pending_write: Option<tokio::task::JoinHandle<Result<()>>> = None;
+    // Ctrl-stream progress acks are batched — one per chunk was a per-8MB round trip
+    // that serialized with reading, capping throughput well below link speed.
+    let mut chunks_since_ack = 0u32;
+    const ACK_INTERVAL: u32 = 4;
     // Bytes fully received, decrypted, and written — reported to the sender so
     // its progress bar reflects confirmed delivery, not buffered writes.
     let mut confirmed: u64 = initial_done;
@@ -224,20 +231,38 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
             continue;
         }
 
-        // ── Write ──────────────────────────────────────────────────────────────
+        // ── Write (pipelined) ─────────────────────────────────────────────────
+        // Wait for the *previous* chunk's write to land before starting a new one
+        // (bounds memory to ~2 chunks and keeps writes ordered), then hand this
+        // chunk's write off to a background task so the next network read isn't
+        // blocked behind disk I/O.
+        if let Some(handle) = pending_write.take() {
+            handle
+                .await
+                .map_err(|e| Error::ConnectionFailed(e.to_string()))??;
+        }
         let offset = chunk_index as u64 * manifest.chunk_size as u64;
-        file.seek(std::io::SeekFrom::Start(offset)).await?;
-        file.write_all(&plaintext).await?;
+        let mut write_handle = file.try_clone().await?;
+        pending_write = Some(tokio::spawn(async move {
+            write_handle.seek(std::io::SeekFrom::Start(offset)).await?;
+            write_handle.write_all(&plaintext).await?;
+            Ok::<(), Error>(())
+        }));
 
         // Progress already advanced per sub-message above.
         pending.remove(&chunk_index);
         state.chunks_done.insert(chunk_index);
 
-        // Report confirmed bytes so the sender's bar tracks real delivery.
+        // Report confirmed bytes so the sender's bar tracks real delivery — batched
+        // rather than sent after every chunk to avoid a per-chunk ctrl round trip.
         confirmed += expected_size as u64;
-        session
-            .send_ctrl(&mut ctrl_send, &ControlMessage::Progress { bytes: confirmed })
-            .await?;
+        chunks_since_ack += 1;
+        if chunks_since_ack >= ACK_INTERVAL || pending.is_empty() {
+            session
+                .send_ctrl(&mut ctrl_send, &ControlMessage::Progress { bytes: confirmed })
+                .await?;
+            chunks_since_ack = 0;
+        }
 
         let done = manifest.chunk_count as usize - pending.len();
         eprintln!(
@@ -257,6 +282,11 @@ async fn receive_file_direct(session: &PeerSession, output_dir: &Path) -> Result
     }
 
     // ── Final save + signal complete ───────────────────────────────────────────
+    if let Some(handle) = pending_write.take() {
+        handle
+            .await
+            .map_err(|e| Error::ConnectionFailed(e.to_string()))??;
+    }
     let s = state.clone();
     tokio::task::spawn_blocking(move || s.save())
         .await

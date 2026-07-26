@@ -276,7 +276,13 @@ pub async fn announce_and_connect_with_code(
 
         // Internet path — DHT poll → hole punch → QUIC (relay fallback).
         result = async {
-            let receiver_addr = poll_for_receiver(dht, infohash_recv, 60).await?;
+            // Wait as long as the share code is valid — a receiver who takes a
+            // few minutes to type the code must not kill the announce (this
+            // select! aborts the LAN arm too if any arm errors out).
+            let wait_secs = secs_until_expiry().max(120);
+            let receiver_addr =
+                poll_for_receiver(dht, infohash_recv, infohash_send, announce_port, wait_secs)
+                    .await?;
             eprintln!("[announce] receiver found at {}", receiver_addr);
 
             // Same-NAT: receiver shares our external IP → hairpin NAT → hole punch guaranteed to fail.
@@ -694,9 +700,13 @@ pub async fn connect_via_relay_only_via_proxy(
 async fn poll_for_receiver(
     dht: &DhtLayer,
     infohash: [u8; 20],
+    own_infohash: [u8; 20],
+    own_port: u16,
     timeout_secs: u64,
 ) -> Result<SocketAddr> {
+    const REANNOUNCE_INTERVAL: Duration = Duration::from_secs(240);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let mut last_announce = tokio::time::Instant::now();
     loop {
         let peers = dht.lookup(infohash).await;
         if let Some(addr) = peers.into_iter().next() {
@@ -704,6 +714,12 @@ async fn poll_for_receiver(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(Error::PeerNotFound);
+        }
+        // Refresh our own DHT entry so it doesn't age out of peers' stores
+        // while we wait for a slow receiver.
+        if last_announce.elapsed() >= REANNOUNCE_INTERVAL {
+            dht.announce(own_infohash, own_port).await;
+            last_announce = tokio::time::Instant::now();
         }
         sleep(Duration::from_millis(1500)).await;
     }

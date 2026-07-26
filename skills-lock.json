@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "apple-ui-skills": {
+      "source": "ihlamury/design-skills",
+      "sourceType": "github",
+      "skillPath": "skills/apple/SKILL.md",
+      "computedHash": "cd8ebe89688d7fb36c838618d1a1847d645a721b231d2a82c746d4d22003b77c"
+    }
+  }
+}

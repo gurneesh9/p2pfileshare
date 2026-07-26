@@ -6,44 +6,77 @@ const MAGIC_COOKIE: u32 = 0x2112A442;
 const STUN_SERVERS: &[&str] = &[
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
+    "stun2.l.google.com:19302",
     "stun.cloudflare.com:3478",
 ];
+const STUN_ATTEMPTS: u32 = 2;
+const STUN_WAIT: Duration = Duration::from_secs(3);
 
-/// Send a STUN Binding Request on `socket` and return the external SocketAddr.
+/// Return the socket's external (NAT-mapped) address.
 ///
-/// The socket must already be bound. We try each STUN server in order and
-/// return the first successful mapping.
+/// Queries every STUN server at once on the shared socket and takes the first
+/// valid response — one 3 s deadline total instead of 3 s per server — and
+/// retries once, so a single lost datagram doesn't push us onto the relay.
 pub async fn external_addr(socket: &UdpSocket) -> Option<SocketAddr> {
-    for server in STUN_SERVERS {
-        if let Ok(addrs) = tokio::net::lookup_host(server).await {
-            for server_addr in addrs {
-                if let Ok(addr) = query_stun(socket, server_addr).await {
-                    return Some(addr);
-                }
-            }
+    for attempt in 0..STUN_ATTEMPTS {
+        if let Some(addr) = query_all(socket).await {
+            return Some(addr);
+        }
+        if attempt + 1 < STUN_ATTEMPTS {
+            eprintln!("[stun] no response, retrying...");
         }
     }
     None
 }
 
-async fn query_stun(socket: &UdpSocket, server: SocketAddr) -> std::io::Result<SocketAddr> {
-    // Build Binding Request
-    let txn_id: [u8; 12] = rand::random();
+async fn query_all(socket: &UdpSocket) -> Option<SocketAddr> {
+    // Fire a Binding Request at every server, remembering (txn_id, server).
+    let mut pending: Vec<([u8; 12], SocketAddr)> = Vec::new();
+    for server in STUN_SERVERS {
+        let Ok(addrs) = tokio::net::lookup_host(server).await else {
+            continue;
+        };
+        let Some(server_addr) = addrs.into_iter().find(|a| a.is_ipv4()) else {
+            continue;
+        };
+        let txn_id: [u8; 12] = rand::random();
+        if socket.send_to(&build_request(&txn_id), server_addr).await.is_ok() {
+            pending.push((txn_id, server_addr));
+        }
+    }
+    if pending.is_empty() {
+        return None;
+    }
+
+    // Accept the first parseable response from any queried server. Unrelated
+    // packets (early punches, stray traffic) are skipped, not treated as failure.
+    let mut buf = [0u8; 512];
+    tokio::time::timeout(STUN_WAIT, async {
+        loop {
+            let Ok((len, from)) = socket.recv_from(&mut buf).await else {
+                return None;
+            };
+            for (txn_id, server_addr) in &pending {
+                if from == *server_addr {
+                    if let Some(addr) = parse_response(&buf[..len], txn_id) {
+                        return Some(addr);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn build_request(txn_id: &[u8; 12]) -> [u8; 20] {
     let mut req = [0u8; 20];
     req[0..2].copy_from_slice(&0x0001u16.to_be_bytes()); // Binding Request
     req[2..4].copy_from_slice(&0x0000u16.to_be_bytes()); // length = 0
     req[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
-    req[8..20].copy_from_slice(&txn_id);
-
-    socket.send_to(&req, server).await?;
-
-    let mut buf = [0u8; 512];
-    let (len, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "STUN timeout"))??;
-
-    parse_response(&buf[..len], &txn_id)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad STUN response"))
+    req[8..20].copy_from_slice(txn_id);
+    req
 }
 
 fn parse_response(buf: &[u8], txn_id: &[u8; 12]) -> Option<SocketAddr> {

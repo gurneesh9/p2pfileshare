@@ -52,7 +52,17 @@ pub async fn hole_punch(socket: Arc<UdpSocket>, peer_addr: SocketAddr) -> Result
     let _ = punch_task.await;
 
     match result {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => {
+            // Success on our side only proves peer→us works. Keep punching
+            // briefly so the peer — whose own loop may still be waiting on our
+            // packets — completes too, and the NAT mapping stays warm while
+            // QUIC sets up.
+            for _ in 0..10 {
+                let _ = socket.send_to(PUNCH_MAGIC, peer_addr).await;
+                sleep(Duration::from_millis(50)).await;
+            }
+            Ok(())
+        }
         Ok(Err(e)) => Err(e),
         Err(_elapsed) => Err(Error::HolePunchTimeout),
     }

@@ -97,6 +97,14 @@ fn p2p_transport_config() -> quinn::TransportConfig {
     // We only need a handful of streams (1 ctrl bi + 1 data uni), but keep
     // headroom for relay-session streams that share the same config path.
     t.max_concurrent_uni_streams(quinn::VarInt::from_u32(8));
+    // BBR instead of the default Cubic. Cubic backs off hard on any packet
+    // loss and probes bandwidth slowly, so on real WiFi/internet paths (which
+    // always have some loss) it settles well below link capacity and takes many
+    // RTTs to get there. BBR models the path's actual bottleneck bandwidth and
+    // RTT, so it reaches — and holds — line rate far faster and isn't derailed
+    // by non-congestion loss. This is the single biggest lever for "use all the
+    // bandwidth the network actually has."
+    t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     // 1400-byte initial MTU — safe on Ethernet/WiFi (Ethernet MTU is 1500).
     // This skips the conservative 1200-byte internet default and the PMTUD
     // probe round-trips it would trigger, giving ~17% more payload per packet
